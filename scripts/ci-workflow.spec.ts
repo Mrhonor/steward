@@ -7,7 +7,8 @@ import { describe, expect, it } from 'vitest'
 
 function evaluateRunsOn(selector: unknown, context: Record<string, unknown>): unknown {
   if (typeof selector !== 'string') throw new TypeError('Runner selector must be a string')
-  return runInNewContext(selector.trim().slice(3, -2), context, { timeout: 1000 })
+  const github = { repository: 'deepseek-harness/deepseek-harness', ...(isRecord(context.github) ? context.github : {}) }
+  return runInNewContext(selector.trim().slice(3, -2), { ...context, github }, { timeout: 1000 })
 }
 
 const root = resolve(import.meta.dirname, '..')
@@ -411,6 +412,10 @@ describe('CI workflow', () => {
       const cores = jobName === 'windows-native-tests' ? 2 : 16
       expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
         .toBe(`blacksmith-${cores}vcpu-windows-2025`)
+      for (const repository of ['Mrhonor/steward', 'hengliao1972/steward']) {
+        expect(evaluateRunsOn(job['runs-on'], { vars: {}, github: { repository } }),
+          `${jobName} must use a standard Windows runner in ${repository}`).toBe('windows-2025')
+      }
       expect(job.if).toBe("github.event_name == 'pull_request'")
     }
 
@@ -562,16 +567,20 @@ describe('CI workflow', () => {
     })
     expect(windowsAggregate.needs).not.toContain('serial-windows')
 
-    // Linux failover is a separate switch: the three enterprise Linux workers
+    // Linux failover is a separate switch: the enterprise Linux workers
     // and the verdict job resolve their pool through DSH_CI_FAILOVER_LINUX,
     // never the Windows switch.
-    for (const [jobName, job] of [['node-24', node24], ['node-24-coverage', node24Coverage], ['node-24-consumers', node24Consumers]] as const) {
+    for (const [jobName, job] of [['node-24', node24], ['node-24-coverage', node24Coverage], ['node-24-lint', workflow.jobs['node-24-lint']], ['node-24-consumers', node24Consumers]] as const) {
       expect(typeof job['runs-on']).toBe('string')
       expect(job['runs-on'], `${jobName} runs-on must use the Linux failover switch`).toContain('DSH_CI_FAILOVER_LINUX')
       expect(job['runs-on'], `${jobName} runs-on must not use the Windows failover switch`).not.toContain('DSH_CI_FAILOVER_WINDOWS')
       expect(job['runs-on']).toContain('vm-backup')
       expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: 'blacksmith' } }))
-        .toBe(`blacksmith-${jobName === 'node-24' ? 8 : 16}vcpu-ubuntu-2404`)
+        .toBe(`blacksmith-${jobName === 'node-24' || jobName === 'node-24-lint' ? 8 : 16}vcpu-ubuntu-2404`)
+      for (const repository of ['Mrhonor/steward', 'hengliao1972/steward']) {
+        expect(evaluateRunsOn(job['runs-on'], { vars: {}, github: { repository } }),
+          `${jobName} must use a standard Linux runner in ${repository}`).toBe('ubuntu-24.04')
+      }
     }
     expect(aggregate['runs-on']).toContain('DSH_CI_FAILOVER_LINUX')
     expect(aggregate['runs-on']).not.toContain('DSH_CI_FAILOVER_WINDOWS')
@@ -688,11 +697,35 @@ describe('CI workflow', () => {
       expect(evaluateRunsOn(benchmark['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: mode } })).toBe('ubuntu-24.04')
     }
     expect(JSON.stringify(benchmark.steps)).not.toContain('DSH_CI_FAILOVER_LINUX')
-    expect(benchmark.if).toBe("github.event_name == 'pull_request'")
+    expect(benchmark.if).toBe("github.event_name == 'pull_request' && github.repository == 'deepseek-harness/deepseek-harness'")
     expect(benchmark.needs).toBeUndefined()
     expect(benchmark['continue-on-error']).toBeUndefined()
     expect(benchmark.env).toBeUndefined()
     expect(aggregate.needs).toContain('node-24-bench')
+    if (typeof benchmark.if !== 'string' || !Array.isArray(aggregate.steps)) throw new TypeError('Benchmark admission and Linux verdict steps are required')
+    const upstream = 'deepseek-harness/deepseek-harness'
+    const fork = 'Mrhonor/steward'
+    for (const [repository, expected] of [[upstream, true], [fork, false]] as const) {
+      expect(runInNewContext(benchmark.if, { github: { event_name: 'pull_request', repository } })).toBe(expected)
+    }
+    const reject = aggregate.steps.filter(isRecord).find(step => step.name === 'Reject failed or unexpectedly skipped Linux checks')
+    if (typeof reject?.if !== 'string') throw new TypeError('Linux verdict must validate expected and unexpected skips')
+    for (const [repository, benchResult, workerResult, shouldFail] of [
+      [upstream, 'success', 'success', false],
+      [upstream, 'skipped', 'success', true],
+      [fork, 'skipped', 'success', false],
+      [fork, 'failure', 'success', true],
+      [fork, 'cancelled', 'success', true],
+      [fork, 'skipped', 'failure', true],
+      [fork, 'skipped', 'cancelled', true],
+      [fork, 'skipped', 'skipped', true],
+    ] as const) {
+      const needs = Object.fromEntries(['node-24', 'node-24-coverage', 'node-24-lint', 'node-24-consumers', 'node-compat']
+        .map(name => [name, { result: workerResult }]))
+      needs['node-24-bench'] = { result: benchResult }
+      expect(runInNewContext(reject.if, { github: { repository }, needs }),
+        `${repository}: benchmark=${benchResult}, workers=${workerResult}`).toBe(shouldFail)
+    }
   })
 
   it('always restores the hosted benchmark pnpm cache', () => {
@@ -910,16 +943,16 @@ describe('CI workflow', () => {
     expect(config).not.toContain('packages/lsp/lsp-stdio/src/instance.ts')
   })
 
-  it('requires release-shaped Python runtime validation on Linux and Windows x64 in CI Python', () => {
+  it('runs all CI Python jobs upstream and skips them in Steward forks', () => {
     const workflow = loadWorkflow('.github/workflows/ci-python.yml')
     const pythonRuntime = workflowJob(workflow, 'python-runtime')
     const aggregate = workflowJob(workflow, 'python-checks-passed')
-    if (!Array.isArray(aggregate.needs)) {
-      throw new TypeError('CI Python aggregate must define required job dependencies')
+    if (!Array.isArray(aggregate.needs) || !Array.isArray(aggregate.steps) || typeof pythonRuntime.if !== 'string' || typeof aggregate.if !== 'string') {
+      throw new TypeError('CI Python must define dependencies, steps, and job admission conditions')
     }
 
     expect(pythonRuntime).toMatchObject({
-      if: "github.event_name == 'pull_request'",
+      if: "github.event_name == 'pull_request' && github.repository == 'deepseek-harness/deepseek-harness'",
       name: 'python runtime / release-shaped matrix',
       uses: './.github/workflows/build-exe-for-python-sdk.yml',
       with: { targets: 'node24-linux-x64,node24-win-x64', ci: true },
@@ -928,6 +961,16 @@ describe('CI workflow', () => {
       },
     })
     expect(aggregate.needs).toEqual(['python-sdk', 'python-runtime'])
+    const upstream = 'deepseek-harness/deepseek-harness'
+    const fork = 'Mrhonor/steward'
+    const sdk = workflowJob(workflow, 'python-sdk')
+    if (typeof sdk.if !== 'string') throw new TypeError('Python SDK must define a job admission condition')
+    for (const [repository, expected] of [[upstream, true], [fork, false]] as const) {
+      const github = { repository, event_name: 'pull_request' }
+      expect(runInNewContext(sdk.if, { github })).toBe(expected)
+      expect(runInNewContext(pythonRuntime.if, { github })).toBe(expected)
+      expect(runInNewContext(aggregate.if.trim().slice(3, -2), { github, cancelled: () => false })).toBe(expected)
+    }
     for (const file of ['ci.yml', 'ci-windows.yml']) {
       const other = loadWorkflow('.github/workflows/' + file)
       if (!isRecord(other.jobs)) throw new TypeError(`${file} must define jobs`)
@@ -1390,6 +1433,32 @@ describe('Python release workflows', () => {
 })
 
 describe('Weighted approval workflow', () => {
+  it('skips approval publication and review handoff in forks while keeping upstream event filters', () => {
+    const publisher = workflowJob(loadWorkflow('.github/workflows/weighted-approval.yml'), 'publish-status')
+    const review = workflowJob(loadWorkflow('.github/workflows/weighted-approval-review-event.yml'), 'record-review-event')
+    if (typeof publisher.if !== 'string' || typeof review.if !== 'string') throw new TypeError('Approval jobs need event guards')
+    for (const repository of ['deepseek-harness/deepseek-harness', 'Mrhonor/steward', 'hengliao1972/steward']) {
+      const upstream = repository === 'deepseek-harness/deepseek-harness'
+      for (const [eventName, event, eligible] of [
+        ['pull_request_target', { pull_request: { state: 'open' } }, true],
+        ['pull_request_target', { pull_request: { state: 'closed' } }, false],
+        ['workflow_run', { workflow_run: { conclusion: 'success' } }, true],
+        ['workflow_run', { workflow_run: { conclusion: 'failure' } }, false],
+        ['issue_comment', { issue: { pull_request: {}, state: 'open' }, comment: { body: '/delegate @reviewer' } }, true],
+        ['issue_comment', { issue: { pull_request: {}, state: 'open' }, comment: { body: 'ordinary comment' }, changes: { body: { from: '' } } }, false],
+      ] as const) {
+        expect(runInNewContext(publisher.if, {
+          github: { repository, event_name: eventName, event },
+          contains: (body: string, value: string) => body.includes(value),
+        }, { timeout: 1000 })).toBe(upstream && eligible)
+      }
+      for (const state of ['open', 'closed']) {
+        expect(runInNewContext(review.if, { github: { repository, event: { pull_request: { state } } } }, { timeout: 1000 }))
+          .toBe(upstream && state === 'open')
+      }
+    }
+  })
+
   it('publishes from the trusted default branch after pull request and review updates', () => {
     const publisher = loadWorkflow('.github/workflows/weighted-approval.yml')
     const reviewEvent = loadWorkflow('.github/workflows/weighted-approval-review-event.yml')
@@ -1429,7 +1498,8 @@ describe('Weighted approval workflow', () => {
       'cancel-in-progress': false,
     })
     expect(job).toMatchObject({
-      if: "(github.event_name != 'pull_request_target' || github.event.pull_request.state == 'open') && "
+      if: "github.repository == 'deepseek-harness/deepseek-harness' && "
+        + "(github.event_name != 'pull_request_target' || github.event.pull_request.state == 'open') && "
         + "(github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && "
         + "(github.event_name != 'issue_comment' || (github.event.issue.pull_request && github.event.issue.state == 'open' &&\n"
         + "  (contains(github.event.comment.body, '/delegate') || contains(github.event.changes.body.from, '/delegate'))))",
@@ -1494,7 +1564,7 @@ describe('Weighted approval workflow', () => {
       run: 'node .github/review-ownership/check-approval.mjs',
     })
     expect(recordJob).toMatchObject({
-      if: "github.event.pull_request.state == 'open'",
+      if: "github.repository == 'deepseek-harness/deepseek-harness' && github.event.pull_request.state == 'open'",
       name: 'record weighted approval review event',
       'runs-on': 'ubuntu-latest',
       'timeout-minutes': 2,
@@ -1560,7 +1630,7 @@ describe('Issue lifecycle workflow', () => {
     expect(preflightStep?.run).toContain('if [ -f .github/issue-management/selective-preflight.json ]; then')
     expect(preflightStep?.run).toContain('node .github/issue-management/policy.mjs pr-preflight')
     expect(preflightStep?.if).toBeUndefined()
-    expect(policyJob.if).toBeUndefined()
+    expect(policyJob.if).toBe("github.repository == 'deepseek-harness/deepseek-harness'")
     expect(validateStep?.if).toBe("${{ steps.preflight.outputs.legacy-automated != 'true' }}")
 
     expect(tokenStep).toMatchObject({
