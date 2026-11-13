@@ -688,11 +688,35 @@ describe('CI workflow', () => {
       expect(evaluateRunsOn(benchmark['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: mode } })).toBe('ubuntu-24.04')
     }
     expect(JSON.stringify(benchmark.steps)).not.toContain('DSH_CI_FAILOVER_LINUX')
-    expect(benchmark.if).toBe("github.event_name == 'pull_request'")
+    expect(benchmark.if).toBe("github.event_name == 'pull_request' && github.repository == 'deepseek-harness/deepseek-harness'")
     expect(benchmark.needs).toBeUndefined()
     expect(benchmark['continue-on-error']).toBeUndefined()
     expect(benchmark.env).toBeUndefined()
     expect(aggregate.needs).toContain('node-24-bench')
+    if (typeof benchmark.if !== 'string' || !Array.isArray(aggregate.steps)) throw new TypeError('Benchmark admission and Linux verdict steps are required')
+    const upstream = 'deepseek-harness/deepseek-harness'
+    const fork = 'Mrhonor/steward'
+    for (const [repository, expected] of [[upstream, true], [fork, false]] as const) {
+      expect(runInNewContext(benchmark.if, { github: { event_name: 'pull_request', repository } })).toBe(expected)
+    }
+    const reject = aggregate.steps.filter(isRecord).find(step => step.name === 'Reject failed or unexpectedly skipped Linux checks')
+    if (typeof reject?.if !== 'string') throw new TypeError('Linux verdict must validate expected and unexpected skips')
+    for (const [repository, benchResult, workerResult, shouldFail] of [
+      [upstream, 'success', 'success', false],
+      [upstream, 'skipped', 'success', true],
+      [fork, 'skipped', 'success', false],
+      [fork, 'failure', 'success', true],
+      [fork, 'cancelled', 'success', true],
+      [fork, 'skipped', 'failure', true],
+      [fork, 'skipped', 'cancelled', true],
+      [fork, 'skipped', 'skipped', true],
+    ] as const) {
+      const needs = Object.fromEntries(['node-24', 'node-24-coverage', 'node-24-lint', 'node-24-consumers', 'node-compat']
+        .map(name => [name, { result: workerResult }]))
+      needs['node-24-bench'] = { result: benchResult }
+      expect(runInNewContext(reject.if, { github: { repository }, needs }),
+        `${repository}: benchmark=${benchResult}, workers=${workerResult}`).toBe(shouldFail)
+    }
   })
 
   it('always restores the hosted benchmark pnpm cache', () => {
@@ -910,16 +934,16 @@ describe('CI workflow', () => {
     expect(config).not.toContain('packages/lsp/lsp-stdio/src/instance.ts')
   })
 
-  it('requires release-shaped Python runtime validation on Linux and Windows x64 in CI Python', () => {
+  it('runs all CI Python jobs upstream and skips them in Steward forks', () => {
     const workflow = loadWorkflow('.github/workflows/ci-python.yml')
     const pythonRuntime = workflowJob(workflow, 'python-runtime')
     const aggregate = workflowJob(workflow, 'python-checks-passed')
-    if (!Array.isArray(aggregate.needs)) {
-      throw new TypeError('CI Python aggregate must define required job dependencies')
+    if (!Array.isArray(aggregate.needs) || !Array.isArray(aggregate.steps) || typeof pythonRuntime.if !== 'string' || typeof aggregate.if !== 'string') {
+      throw new TypeError('CI Python must define dependencies, steps, and job admission conditions')
     }
 
     expect(pythonRuntime).toMatchObject({
-      if: "github.event_name == 'pull_request'",
+      if: "github.event_name == 'pull_request' && github.repository == 'deepseek-harness/deepseek-harness'",
       name: 'python runtime / release-shaped matrix',
       uses: './.github/workflows/build-exe-for-python-sdk.yml',
       with: { targets: 'node24-linux-x64,node24-win-x64', ci: true },
@@ -928,6 +952,16 @@ describe('CI workflow', () => {
       },
     })
     expect(aggregate.needs).toEqual(['python-sdk', 'python-runtime'])
+    const upstream = 'deepseek-harness/deepseek-harness'
+    const fork = 'Mrhonor/steward'
+    const sdk = workflowJob(workflow, 'python-sdk')
+    if (typeof sdk.if !== 'string') throw new TypeError('Python SDK must define a job admission condition')
+    for (const [repository, expected] of [[upstream, true], [fork, false]] as const) {
+      const github = { repository, event_name: 'pull_request' }
+      expect(runInNewContext(sdk.if, { github })).toBe(expected)
+      expect(runInNewContext(pythonRuntime.if, { github })).toBe(expected)
+      expect(runInNewContext(aggregate.if.trim().slice(3, -2), { github, cancelled: () => false })).toBe(expected)
+    }
     for (const file of ['ci.yml', 'ci-windows.yml']) {
       const other = loadWorkflow('.github/workflows/' + file)
       if (!isRecord(other.jobs)) throw new TypeError(`${file} must define jobs`)
