@@ -7,7 +7,8 @@ import { describe, expect, it } from 'vitest'
 
 function evaluateRunsOn(selector: unknown, context: Record<string, unknown>): unknown {
   if (typeof selector !== 'string') throw new TypeError('Runner selector must be a string')
-  return runInNewContext(selector.trim().slice(3, -2), context, { timeout: 1000 })
+  const github = { repository: 'deepseek-harness/deepseek-harness', ...(isRecord(context.github) ? context.github : {}) }
+  return runInNewContext(selector.trim().slice(3, -2), { ...context, github }, { timeout: 1000 })
 }
 
 const root = resolve(import.meta.dirname, '..')
@@ -411,6 +412,10 @@ describe('CI workflow', () => {
       const cores = jobName === 'windows-native-tests' ? 2 : 16
       expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
         .toBe(`blacksmith-${cores}vcpu-windows-2025`)
+      for (const repository of ['Mrhonor/steward', 'hengliao1972/steward']) {
+        expect(evaluateRunsOn(job['runs-on'], { vars: {}, github: { repository } }),
+          `${jobName} must use a standard Windows runner in ${repository}`).toBe('windows-2025')
+      }
       expect(job.if).toBe("github.event_name == 'pull_request'")
     }
 
@@ -562,16 +567,20 @@ describe('CI workflow', () => {
     })
     expect(windowsAggregate.needs).not.toContain('serial-windows')
 
-    // Linux failover is a separate switch: the three enterprise Linux workers
+    // Linux failover is a separate switch: the enterprise Linux workers
     // and the verdict job resolve their pool through DSH_CI_FAILOVER_LINUX,
     // never the Windows switch.
-    for (const [jobName, job] of [['node-24', node24], ['node-24-coverage', node24Coverage], ['node-24-consumers', node24Consumers]] as const) {
+    for (const [jobName, job] of [['node-24', node24], ['node-24-coverage', node24Coverage], ['node-24-lint', workflow.jobs['node-24-lint']], ['node-24-consumers', node24Consumers]] as const) {
       expect(typeof job['runs-on']).toBe('string')
       expect(job['runs-on'], `${jobName} runs-on must use the Linux failover switch`).toContain('DSH_CI_FAILOVER_LINUX')
       expect(job['runs-on'], `${jobName} runs-on must not use the Windows failover switch`).not.toContain('DSH_CI_FAILOVER_WINDOWS')
       expect(job['runs-on']).toContain('vm-backup')
       expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: 'blacksmith' } }))
-        .toBe(`blacksmith-${jobName === 'node-24' ? 8 : 16}vcpu-ubuntu-2404`)
+        .toBe(`blacksmith-${jobName === 'node-24' || jobName === 'node-24-lint' ? 8 : 16}vcpu-ubuntu-2404`)
+      for (const repository of ['Mrhonor/steward', 'hengliao1972/steward']) {
+        expect(evaluateRunsOn(job['runs-on'], { vars: {}, github: { repository } }),
+          `${jobName} must use a standard Linux runner in ${repository}`).toBe('ubuntu-24.04')
+      }
     }
     expect(aggregate['runs-on']).toContain('DSH_CI_FAILOVER_LINUX')
     expect(aggregate['runs-on']).not.toContain('DSH_CI_FAILOVER_WINDOWS')
