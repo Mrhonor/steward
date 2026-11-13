@@ -1433,6 +1433,32 @@ describe('Python release workflows', () => {
 })
 
 describe('Weighted approval workflow', () => {
+  it('skips approval publication and review handoff in forks while keeping upstream event filters', () => {
+    const publisher = workflowJob(loadWorkflow('.github/workflows/weighted-approval.yml'), 'publish-status')
+    const review = workflowJob(loadWorkflow('.github/workflows/weighted-approval-review-event.yml'), 'record-review-event')
+    if (typeof publisher.if !== 'string' || typeof review.if !== 'string') throw new TypeError('Approval jobs need event guards')
+    for (const repository of ['deepseek-harness/deepseek-harness', 'Mrhonor/steward', 'hengliao1972/steward']) {
+      const upstream = repository === 'deepseek-harness/deepseek-harness'
+      for (const [eventName, event, eligible] of [
+        ['pull_request_target', { pull_request: { state: 'open' } }, true],
+        ['pull_request_target', { pull_request: { state: 'closed' } }, false],
+        ['workflow_run', { workflow_run: { conclusion: 'success' } }, true],
+        ['workflow_run', { workflow_run: { conclusion: 'failure' } }, false],
+        ['issue_comment', { issue: { pull_request: {}, state: 'open' }, comment: { body: '/delegate @reviewer' } }, true],
+        ['issue_comment', { issue: { pull_request: {}, state: 'open' }, comment: { body: 'ordinary comment' }, changes: { body: { from: '' } } }, false],
+      ] as const) {
+        expect(runInNewContext(publisher.if, {
+          github: { repository, event_name: eventName, event },
+          contains: (body: string, value: string) => body.includes(value),
+        }, { timeout: 1000 })).toBe(upstream && eligible)
+      }
+      for (const state of ['open', 'closed']) {
+        expect(runInNewContext(review.if, { github: { repository, event: { pull_request: { state } } } }, { timeout: 1000 }))
+          .toBe(upstream && state === 'open')
+      }
+    }
+  })
+
   it('publishes from the trusted default branch after pull request and review updates', () => {
     const publisher = loadWorkflow('.github/workflows/weighted-approval.yml')
     const reviewEvent = loadWorkflow('.github/workflows/weighted-approval-review-event.yml')
@@ -1472,7 +1498,8 @@ describe('Weighted approval workflow', () => {
       'cancel-in-progress': false,
     })
     expect(job).toMatchObject({
-      if: "(github.event_name != 'pull_request_target' || github.event.pull_request.state == 'open') && "
+      if: "github.repository == 'deepseek-harness/deepseek-harness' && "
+        + "(github.event_name != 'pull_request_target' || github.event.pull_request.state == 'open') && "
         + "(github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && "
         + "(github.event_name != 'issue_comment' || (github.event.issue.pull_request && github.event.issue.state == 'open' &&\n"
         + "  (contains(github.event.comment.body, '/delegate') || contains(github.event.changes.body.from, '/delegate'))))",
@@ -1537,7 +1564,7 @@ describe('Weighted approval workflow', () => {
       run: 'node .github/review-ownership/check-approval.mjs',
     })
     expect(recordJob).toMatchObject({
-      if: "github.event.pull_request.state == 'open'",
+      if: "github.repository == 'deepseek-harness/deepseek-harness' && github.event.pull_request.state == 'open'",
       name: 'record weighted approval review event',
       'runs-on': 'ubuntu-latest',
       'timeout-minutes': 2,
