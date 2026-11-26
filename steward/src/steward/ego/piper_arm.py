@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from steward.assembly_profile import enabled as _assembly_enabled
 from steward.ego.kinematics import _link_pose
 from steward.ego.collision_policy import SelfCollisionPolicy
 from steward.ego.arm import VIRTUAL_JOINTS, Arm, ArmGeometry
@@ -399,7 +400,12 @@ class PiperArm(Arm):
         return None, last
 
     def _roll_about_tool_x(self, pitch: float, roll: float) -> bool:
-        """Whether ``wrist_roll`` tips about tool +x (drive bit-down) rather than tool +z."""
+        """Whether ``wrist_roll`` tips about tool +x (drive bit-down) rather than tool +z.
+
+        The toy assembly profile always rolls about tool +z, the convention its fastening planners
+        search with :meth:`tool_rotation`."""
+        if _assembly_enabled():
+            return False
         return abs(pitch) < self.config.roll_about_x_pitch and abs(roll) <= self.config.roll_about_x_max
 
     def _step(self, a: dict, b: dict) -> bool:
