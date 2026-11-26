@@ -695,6 +695,16 @@ class StewardHost:
             except TimeoutError as exc:
                 raise HttpError(504, str(exc)) from exc
 
+        def recovery_clock(q, b):
+            owner, action = b.get("owner"), b.get("action")
+            if not isinstance(owner, str) or not owner or len(owner) > 100 or action not in ("pause", "renew", "release"):
+                raise HttpError(400, "invalid recovery clock lease")
+            try:
+                self._require_sim().recovery_clock(f"{rid}/{owner}", action, b.get("episode"))
+            except ValueError as exc:
+                raise HttpError(409, str(exc)) from exc
+            return {"supported": True}
+
         def telemetry(q, b):
             if not isinstance(b, dict):
                 raise HttpError(400, "telemetry body must be an ego SceneState")
@@ -719,6 +729,7 @@ class StewardHost:
             ("POST", "/command"): lambda q, b: self._require_sim().command(rid, b or {}),
             ("POST", "/telemetry"): telemetry,
             ("POST", "/clock/wait"): clock_wait,
+            ("POST", "/clock/recovery"): recovery_clock,
             ("POST", "/clock/release"): lambda q, b: self._require_sim().release(f"{rid}/{b['hold']}") or {},
             ("POST", "/clock/renew"): lambda q, b: self._require_sim().renew(f"{rid}/{b['hold']}") or {},
         }

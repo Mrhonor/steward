@@ -613,7 +613,7 @@ class Fasten(AssembleOnto):
         for joint, value in plan['parkWrist'].items():
             if joint in self.ex._state()['joints']:
                 self.ex._set_joint(joint, value, tol=.02)
-        self.ex._backoff(plan)
+        self.ex._backoff(job, plan)
 
     def contact_error(self, plan):
         feature = self.feature(plan['object'])
@@ -713,7 +713,7 @@ class Fasten(AssembleOnto):
             for key in ('wrist_yaw','wrist_roll','wrist_pitch'):
                 if key in self.ex._state()['joints']:
                     self.ex._set_joint(key, 0., tol=.02)
-        self.ex._backoff(plan)
+        self.ex._backoff(job, plan)
 
     def seat(self, job, plan):
         if plan.get('method', 'simple') == 'simple':

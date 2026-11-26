@@ -34,17 +34,19 @@ from steward.ego.perception import (PerceptionConfig, box_of, decimated, decode_
                                     top_face,
                                     top_face_array,
                                     world_up_face)
-from steward.ego.kinematics import gripper_pose
+from steward.ego.kinematics import BASE_AXES, CAMERA_AXES, base_to_odometry, camera_to_base, gripper_pose, gripper_to_base
 from steward.ego.arm import Arm
 from steward.ego.esim import Esim, EsimConfig, PredictionError
 from steward.ego.estimator import SELF_ID, EgoEstimator, _CONTENT
+from steward.ego.fault_monitor import FaultMonitor, FaultMonitorConfig, motion_feedback
+from steward.ego.sensor_analysis import analyze_sensor
 from steward.ego.localization_feedback import LocalizationFeedback
 from steward.ego import reflection
 from steward.ego.reflection import ReflectionConfig
 from steward.ego.roles import RoleConfig, assign_roles
 from steward.ego.segmenter import DepthClusters, Segmenter, SegmenterError
 from steward.ego.segmentation_preview import SegmentationPreview
-from steward.ego.skills import MotionConfig, SkillExecutor, SkillFailed
+from steward.ego.skills import GraspIdentityFailed, Job, MotionConfig, SkillExecutor, SkillFailed
 from steward.math3d import matrix_from_quat, pose_compose, pose_inverse, quat_rotate, wrap_angle, yaw_from_quat
 from steward.net import HttpError, call
 from steward.scene.schema import SceneState
@@ -138,6 +140,7 @@ class RuntimeConfig:
     motion: MotionConfig = field(default_factory=MotionConfig)
     roles: RoleConfig = field(default_factory=RoleConfig)
     reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
+    fault_monitor: FaultMonitorConfig = field(default_factory=FaultMonitorConfig)
     localization_config: str | None = None
     """Opt-in segmented-depth localization TOML; diagnostic unless localization_apply is enabled."""
     localization_apply: bool = False
@@ -237,7 +240,8 @@ class RobotLink:
 
     def wait_until(self, t: float | None = None, hold: str | None = None, rank: int = 0, pulls: bool = True) -> float:
         """Wait until the world clock reaches ``t`` (``None``: now) and, with ``hold``, the world lets
-        this control loop or input run (:meth:`WorldSim.wait_until`); return the world time then."""
+        this control loop or input run (:meth:`WorldSim.wait_until`); return the world time then.
+        Passive waits may span an idle or paused clock and retry until the link closes."""
         body = {"hold": hold, "rank": rank, "pulls": pulls, **({} if t is None else {"until": t})}
         deadline = time.monotonic() + 60.0
         while True:
@@ -246,7 +250,7 @@ class RobotLink:
             except HttpError as exc:
                 if exc.status != 504 or self.closed:
                     raise
-                if time.monotonic() >= deadline:
+                if pulls and time.monotonic() >= deadline:
                     raise SkillFailed("robot clock wait timed out after 60 s") from exc
 
     def arm(self, hold: str, t: float | None = None, rank: int = 0, pulls: bool = True) -> None:
@@ -269,8 +273,19 @@ class RobotLink:
     def renew(self, hold: str) -> None:
         call("POST", f"{self.url}/clock/renew", {"hold": hold})
 
+    def recovery_clock(self, owner: str, action: str, episode: int | None) -> bool:
+        """Use the simulated robot clock when its port supports pausing physics."""
+        try:
+            call("POST", f"{self.url}/clock/recovery", {"owner": owner, "action": action, "episode": episode}, timeout=3)
+        except HttpError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        return True
+
 
 ALERT_TEXT_MAX = 1500
+RECOVERY_CONTEXT_MAX = 12_000
 QUERY_MIN_PROBABILITY = 0.2
 MATCH_REFERENCE_CELLS_MAX = 192  # cells along a reference side for match_face
 MATCH_MIN_COVERAGE = 0.5  # share of a face that must have been seen to match it
@@ -379,6 +394,8 @@ class EgoRuntime:
         self.plan: dict | None = None
         self._episode: int | None = None  # the world's episode number of the last sensor frame
         self._generation = 0  # counts restarts: state read in one episode is not applied in the next
+        self.fault_monitor = FaultMonitor(self.config.fault_monitor)
+        self._recovery_ids = itertools.count(1)
         self._receipt_generation: dict[str, int] = {}  # receipt id -> the generation it was predicted in
         self._looked_at: dict[str, float] = {}  # target id -> body stamp of its last fresh look
         self._roles: dict[str, str] = {}  # the latest role assignment, kept unless clearly outweighed
@@ -897,6 +914,7 @@ class EgoRuntime:
         cancel any running skill. Track ids start again at ``e:1``."""
         self.executor.cancel()
         self._generation += 1
+        self.fault_monitor = FaultMonitor(self.config.fault_monitor)
         self.estimator = EgoEstimator(robot_model=self.estimator.robot_model, config=self.estimator.config)
         self.receipts.clear()
         self._receipt_generation.clear()  # skills predicted before now are of another episode
@@ -1023,6 +1041,7 @@ class EgoRuntime:
                     belief = self._keep_motion_belief()
         state = {key: dict(value) if isinstance(value, dict) else value for key, value in belief.items()}
         state.pop("generation", None)
+        state["feedbackSource"] = "estimator"
         try:
             live = self.link.sensors()
         except Exception:  # noqa: BLE001 - the belief is still a usable answer when the body cannot be reached
@@ -1035,6 +1054,9 @@ class EgoRuntime:
                     and live["episode"] != belief["episode"]) or belief.get("generation") != self._generation:
             return self.arm.virtualize(state)
         live = self._feedback_header(live)
+        active_gripper = self.arm.geometry.gripper
+        if live.get("stamp") is not None and (active_gripper in (live.get("grippers") or {}) or live.get("gripper")):
+            state["feedbackSource"] = "live"
         for key in ("stamp", "odometry", "joints", "gripper", "grippers"):
             if live.get(key) is not None:
                 state[key] = live[key]
@@ -1053,7 +1075,10 @@ class EgoRuntime:
         """Record the grasp the skill just felt, measured against the body as it is now: the last
         perception update can be a slow segmentation old, from before the base docked and the arm
         reached down, and an offset taken against it leaves the load believed half a metre from
-        the hand (every place then plans its height from there)."""
+        the hand (every place then plans its height from there).
+
+        :raises GraspIdentityFailed: ideal sensor feedback cannot confirm the requested track.
+        """
         generation, at, body = self._skill_generation(), self.estimator.stamp, None
         try:
             body = self.link.sensors()
@@ -1063,8 +1088,20 @@ class EgoRuntime:
         with self._lock:
             if not self._same_episode(generation, body):  # the skill or the body is another episode's
                 return track_id
+            gripper = self.arm.geometry.gripper
+            track = self.estimator.tracks.get(track_id)
+            expected = track.object_ref if track is not None else None
+            grip = ((body.get("grippers") or {}).get(gripper) or body.get("gripper") or {}) if body else {}
+            if body is None and expected is not None:
+                raise GraspIdentityFailed(f"cannot verify grasp of {track_id}: no fresh gripper feedback")
+            verified = "heldObjectRef" in grip
+            if verified and (expected is None or grip["heldObjectRef"] != expected):
+                actual = grip["heldObjectRef"]
+                matches = [t.id for t in self.estimator.tracks.values() if actual is not None and t.object_ref == actual]
+                observed = matches[0] if len(matches) == 1 else "unconfirmed"
+                raise GraspIdentityFailed(f"grasp target mismatch: expected {track_id}, actual track {observed}")
             body = self._feedback_header(body)
-            held = self.estimator.mark_held(track_id, at, gripper=self.arm.geometry.gripper, body=body)
+            held = self.estimator.mark_held(track_id, at, gripper=gripper, body=body, identity_verified=verified)
             track = getattr(self.estimator, 'tracks', {}).get(held)
             if track is not None and track.held_tool_feature is not None:
                 virtual = self.arm.joints_of((body or {}).get('joints', self.estimator.joints),
@@ -1215,6 +1252,7 @@ class EgoRuntime:
                         obj["placementEvidence"]["observedAt"] = evidence["observation"]["stamp"]
             roles = assign_roles(objects, self.config.roles, self._roles)
             self._roles = {oid: role for oid, (role, _) in roles.items()}
+            fault = self.fault_monitor.status()
         for obj in objects:
             obj["role"], confidence = roles[obj["id"]]
             obj["roleConfidence"] = round(confidence, 3)
@@ -1231,6 +1269,7 @@ class EgoRuntime:
             "objects": objects,
             "dropped": dropped,
             "currentSkill": job,
+            "fault": fault,
             "perception": self.perception_mode,
             **({"segmentation": dict(self.segmentation)} if self.perception_mode == "rgbd-segmenter" else {}),
             "runtimeError": self.last_error,
@@ -1618,6 +1657,7 @@ class EgoRuntime:
         if not 4 <= px <= 128:
             raise ValueError("px must be between 4 and 128")
         with self._lock:
+            generation = self._generation
             track = self.estimator.tracks.get(entity)
             if track is None:
                 raise KeyError(f"unknown object {entity!r}")
@@ -1645,10 +1685,16 @@ class EgoRuntime:
             within = focal * side / self.config.detail_px
             hint["detailHint"] = (f"the face spans only {source_px:.0f} px of the {frame['camera']} image from "
                                   f"{distance:.2f} m; its picture is reliable within {within:.2f} m of the camera")
-        return {"entity": entity, "px": px, "camera": frame["camera"], "yawDeg": round(math.degrees(yaw), 2),
+        face = {"entity": entity, "px": px, "camera": frame["camera"], "yawDeg": round(math.degrees(yaw), 2),
                 "sizeM": [round(float(v), 3) for v in size], "coverage": round(coverage, 3),
                 "sourcePx": round(source_px, 1), **face_colour_stats(rows), **hint,
                 "rows": rows, "worldRows": world_rows, "worldTurnDeg": turn, "stamp": frame["header"]["stamp"]}
+        interior = [cell for row in rows[1:-1] for cell in row[1:-1] if cell is not None]
+        median = np.median(interior, axis=0).tolist() if interior else None
+        with self._lock:
+            if generation == self._generation:
+                self.fault_monitor.observe_face(face, median)
+        return face
 
     def _view_hint(self, odometry: dict, centre: np.ndarray, top: float) -> str:
         """:func:`view_hint` for every camera perception uses at ``odometry``, one clause each."""
@@ -1976,6 +2022,441 @@ class EgoRuntime:
         return self.alerts_view()
 
     # ---------------------------------------------------------------- activity
+    def fault_status(self) -> dict:
+        """Return the episode's diagnostic state and recent action and sensor records."""
+        with self._lock:
+            monitor = self.fault_monitor
+            return {**monitor.status(), "actions": copy.deepcopy(list(monitor.actions)),
+                    "observations": copy.deepcopy(list(monitor.observations)),
+                    **({"lastRecovery": copy.deepcopy(monitor.last_recovery)} if monitor.last_recovery else {})}
+
+    def fault_state(self) -> dict:
+        """Return the current recovery state without copying evidence history."""
+        with self._lock:
+            return self.fault_monitor.status()
+
+    def report_degraded(self, reason: str) -> dict:
+        """Latch degradation for this episode and return the originating evidence."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a degraded report needs a reason")
+        reason = reason.strip()[:ALERT_TEXT_MAX]
+        with self._lock:
+            if self.fault_monitor.report(self.estimator.stamp, reason):
+                self._log("state", f"DEGRADED：{reason}")
+            return self.fault_monitor.status()
+
+    def begin_recovery(self, job_id: str | None, context: str, *, task_review: bool = False) -> dict:
+        """Open one diagnostic attempt and capture only robot-port evidence."""
+        if not 0 < len(context.strip()) <= RECOVERY_CONTEXT_MAX:
+            raise ValueError(f"recovery context must contain 1 to {RECOVERY_CONTEXT_MAX} characters")
+        with self._lock:
+            monitor = self.fault_monitor
+            if task_review and monitor.required_diagnosis is not None:
+                raise ValueError("the repeated action requires diagnosis before review")
+            running = self.executor.current
+            if running is not None and running.is_running:
+                raise ValueError("wait for the active skill before starting diagnosis")
+            recovery_id = f"recovery-{next(self._recovery_ids)}"
+            monitor.begin_recovery(recovery_id, self.estimator.stamp, job_id)
+            generation = self._generation
+            plan = self.plan or {}
+            target = monitor.recovery["faultJob"]
+            track = self.estimator.tracks.get(target["target"]) if target is not None else None
+            context_view = {"operatorContext": context.strip(), "goal": plan.get("goal"),
+                            "step": plan.get("current"),
+                            "targetEstimate": {"position": track.pos.tolist(), "category": track.category}
+                            if track is not None else None}
+        try:
+            return self._capture_recovery(monitor, generation, recovery_id, context_view)
+        except Exception:
+            with self._lock:
+                attempt = monitor.recovery
+                if attempt is not None and attempt["id"] == recovery_id and attempt["phase"] == "diagnosing":
+                    monitor.finish_diagnosis(recovery_id, self.estimator.stamp, False)
+            raise
+
+    def _recovery_kinematics(self, header: dict | None) -> dict:
+        """Report robot geometry and, when sampled, raw encoders and gripper-link pose."""
+        arm = self.arm.geometry
+        result = {"base_axes": BASE_AXES, "gripper_link": arm.gripper,
+                  "armGeometry": {"toolOffsetM": arm.tool_offset, "armLateralM": arm.lateral,
+                                  "reachRangeM": [arm.reach_min, arm.reach_max],
+                                  "liftRangeM": [arm.lift_min, arm.lift_max],
+                                  "wristYawLimitRad": arm.wrist_yaw_max, "wristRollLimitRad": arm.wrist_roll_max,
+                                  "wristPitchLimitRad": arm.wrist_pitch_max, "jawOpeningM": arm.jaw_opening}}
+        if header is not None:
+            encoders = dict(header.get("joints") or {})
+            odom = header.get("odometry") or {}
+            result.update(stamp=header["stamp"], joint_encoders=encoders,
+                          odometry={key: odom[key] for key in ("x", "y", "yaw") if key in odom})
+            try:
+                result["gripper_to_base"] = gripper_to_base(self.estimator.robot_model, encoders, arm.gripper).tolist()
+            except (KeyError, ValueError) as exc:
+                result["gripperPoseError"] = str(exc)
+        return result
+
+    def _recovery_camera_geometry(self, frame: dict, camera: str, stride: int) -> dict:
+        """Describe the strided RGB-D pixels and transforms from their own encoder sample."""
+        height, width = frame["depth"].shape
+        result = {"sourceWidth": width, "sourceHeight": height, "pixelStride": stride,
+                  "camera_axes": CAMERA_AXES, "depth_convention": "camera_z_m"}
+        fovy = frame["fovy"]
+        if 0 < fovy < 180:
+            fx = height / (2 * math.tan(math.radians(fovy) / 2)) / stride
+            cx, cy = (width - 1) / (2 * stride), (height - 1) / (2 * stride)
+            result["K"] = [[fx, 0, cx], [0, fx, cy], [0, 0, 1]]
+        else:
+            result["intrinsicsError"] = "RGB-D field of view is invalid"
+        header = frame["header"]
+        try:
+            camera_base = camera_to_base(self.estimator.robot_model, header.get("joints") or {}, camera)
+            result["camera_to_base"] = camera_base.tolist()
+            result["camera_to_odometry"] = (base_to_odometry(header.get("odometry") or {}) @ camera_base).tolist()
+            ego_header = self._feedback_header(header)
+            if ego_header is not header:
+                result["camera_to_ego"] = (base_to_odometry(ego_header["odometry"]) @ camera_base).tolist()
+        except (KeyError, ValueError) as exc:
+            result["transformError"] = str(exc)
+        return result
+
+    def _recovery_packet(self, generation: int, camera: str | None = None) -> dict:
+        """Read and detach one robot-port packet, omitting labels, masks, and simulator references."""
+        body = frame = None
+        cameras = []
+        try:
+            body = self.link.sensors()
+            provided = {sensor["id"] for sensor in body.get("cameras", [])}
+            cameras = [name for name in self.estimator.cameras if name in provided]
+            if camera not in cameras and camera is not None:
+                raise ValueError("unavailable robot camera")
+            if camera is None and cameras:
+                camera = next((name for name in cameras if self.config.cameras is None or name in self.config.cameras), cameras[0])
+            if camera is not None:
+                frame = decode_rgbd(self.link.rgbd(camera))
+        except (HttpError, OSError, ValueError, KeyError, TimeoutError) as exc:
+            error = f"sensor capture unavailable ({type(exc).__name__})"
+        else:
+            error = None if frame is not None else "no camera available"
+        with self._lock:
+            if not self._same_episode(generation, body):
+                raise ValueError("robot episode changed during recovery capture")
+            packet = {"body": None, "cameras": cameras, "requestedCamera": camera, "captureError": error}
+            kinematics_header = body
+            if body is not None:
+                body = self._feedback_header(body)
+                gripper = (body.get("grippers") or {}).get(self.arm.geometry.gripper) or body.get("gripper") or {}
+                packet["body"] = motion_feedback({**body, "gripper": gripper, "feedbackSource": "live"})
+            if frame is not None and not self._same_episode(generation, frame["header"]):
+                packet["captureError"] = "camera frame belongs to another episode"
+            elif frame is not None and frame["camera"] not in (None, camera):
+                packet["captureError"] = "camera frame does not match the requested camera"
+            elif frame is not None:
+                kinematics_header = frame["header"]
+                stride = max(1, math.ceil(max(frame["depth"].shape) / 64))
+                rgb, depth = frame["rgb"][::stride, ::stride], frame["depth"][::stride, ::stride].copy()
+                valid = np.isfinite(depth) & (depth > 0)
+                depth[~valid] = 0
+                packet["camera"] = {"name": camera, "stamp": frame["header"]["stamp"],
+                                    "width": depth.shape[1], "height": depth.shape[0], "fovy": frame["fovy"],
+                                    **self._recovery_camera_geometry(frame, camera, stride),
+                                    "validDepthRatio": float(valid.mean()) if valid.size else 0.0,
+                                    "rgb": rgb.reshape(-1, 3).tolist(), "depth_m": depth.ravel().tolist()}
+            packet["kinematics"] = self._recovery_kinematics(kinematics_header)
+            return packet
+
+    @staticmethod
+    def _recovery_packet_metadata(ref: str, packet: dict) -> dict:
+        camera = packet.get("camera")
+        return {"ref": ref, **{k: v for k, v in packet.items() if k != "camera"},
+                **({"camera": {k: v for k, v in camera.items() if k not in ("rgb", "depth_m")}} if camera else {})}
+
+    def _capture_recovery(self, monitor: FaultMonitor, generation: int, recovery_id: str, context_view: dict) -> dict:
+        packet = self._recovery_packet(generation)
+        with self._lock:
+            if generation != self._generation:
+                raise ValueError("robot episode changed during recovery capture")
+            attempt = monitor.require_recovery(recovery_id, "diagnosing")
+            attempt.update(sensor=packet, context=context_view, captures={})
+            actions, observations = monitor.diagnosis_history(recovery_id)
+            diagnostic = {"fault": monitor.status(), "context": context_view,
+                          "actions": actions, "observations": observations,
+                          "sensor": self._recovery_packet_metadata("baseline", packet)}
+            self._log("state", "RECOVERY：已采集机器人基线证据")
+            return {"id": recovery_id, "diagnostic": diagnostic}
+
+    def _recovery_scope(self, recovery_id: str, review_id: str | None) -> tuple[dict, dict]:
+        attempt = self.fault_monitor.require_recovery(recovery_id, "reviewing" if review_id else "diagnosing")
+        scope = attempt["review"] if review_id else attempt
+        if review_id and scope["id"] != review_id:
+            raise ValueError("recovery review is no longer active")
+        return attempt, scope
+
+    def capture_recovery_rgbd(self, recovery_id: str, review_id: str | None, camera: str | None) -> dict:
+        """Obtain a new RGB-D sample from a camera attached to this robot."""
+        with self._lock:
+            _, scope = self._recovery_scope(recovery_id, review_id)
+            if len(scope["captures"]) >= 8:
+                raise ValueError("the recovery session has reached its camera sample limit")
+            generation = self._generation
+        packet = self._recovery_packet(generation, camera)
+        with self._lock:
+            _, scope = self._recovery_scope(recovery_id, review_id)
+            frames = scope["captures"]
+            if generation != self._generation or len(frames) >= 8:
+                raise ValueError("the recovery camera read is no longer available")
+            ref = f"{'frame' if review_id else 'before-frame'}-{len(frames) + 1}"
+            frames[ref] = packet
+            metadata = self._recovery_packet_metadata(ref, packet)
+            sample = packet.get("camera")
+            if sample:
+                w, h = sample["width"], sample["height"]
+                # Give text-only model routes a compact preview, with full sampled pixels available to Python.
+                metadata["preview"] = [[{"rgb": sample["rgb"][y * w + x],
+                                          "depthM": round(sample["depth_m"][y * w + x], 3)}
+                                         for x in range(0, w, max(1, math.ceil(w / 8)))]
+                                        for y in range(0, h, max(1, math.ceil(h / 8)))]
+            return metadata
+
+    def analyze_recovery(self, recovery_id: str, code: str, review_id: str | None = None, ref: str | None = None) -> dict:
+        """Evaluate bounded Python on a robot packet from this diagnosis or review."""
+        with self._lock:
+            attempt, scope = self._recovery_scope(recovery_id, review_id)
+            ref = ref or ("post" if review_id else "baseline")
+            packet = attempt["sensor"] if ref == "baseline" else scope["captures"].get(ref, attempt["captures"].get(ref))
+            if packet is None:
+                raise ValueError("unknown recovery sensor sample")
+        result = analyze_sensor(packet, code)
+        with self._lock:
+            self._recovery_scope(recovery_id, review_id)
+        return result
+
+    def recovery_clock(self, recovery_id: str, review_id: str | None, owner: str, action: str) -> dict:
+        """Pause the simulated clock for an active recovery turn and release by lease owner."""
+        with self._lock:
+            if action == "pause":
+                attempt, _ = self._recovery_scope(recovery_id, review_id)
+                self._require_answered_recovery_context(attempt)
+            episode = self._episode
+        return {"supported": self.link.recovery_clock(owner, action, episode)}
+
+    def finish_recovery_diagnosis(self, recovery_id: str, completed: bool, report: dict | None = None,
+                                  child_id: str | None = None) -> dict:
+        """Save the diagnosis or abandon recovery while preserving the originating fault."""
+        with self._lock:
+            monitor = self.fault_monitor
+            if completed:
+                attempt = monitor.require_recovery(recovery_id, "diagnosing")
+                self._require_answered_recovery_context(attempt)
+                if attempt.get("childId") is not None and attempt["childId"] != child_id:
+                    raise ValueError("recovery diagnosis must come from its original child session")
+                attempt["childId"] = child_id
+            monitor.finish_diagnosis(recovery_id, self.estimator.stamp, completed, report)
+            return monitor.status()
+
+    @staticmethod
+    def _require_answered_recovery_context(attempt: dict) -> None:
+        if attempt.get("contextRequest") is not None:
+            raise ValueError("answer the pending recovery context request first")
+
+    def request_recovery_context(self, recovery_id: str, review_id: str | None, child_id: str, parent_id: str,
+                                 question: str, reason: str) -> dict:
+        """Park the scoped child turn while EH supplies additional information."""
+        with self._lock:
+            attempt, scope = self._recovery_scope(recovery_id, review_id)
+            self._require_answered_recovery_context(attempt)
+            if scope.get("childId") is not None and scope["childId"] != child_id:
+                raise ValueError("recovery context must be requested by the original child session")
+            attempt["childId"] = child_id
+            request = {"id": f"context-{next(self._recovery_ids)}", "question": question, "reason": reason}
+            attempt.update(contextRequest=request, contextOwner=parent_id)
+            return {**self.fault_monitor.status(), "needsContext": True, "request": copy.deepcopy(request)}
+
+    def answer_recovery_context(self, recovery_id: str, request_id: str, parent_id: str, answer: str) -> dict:
+        """Consume one pending question and return the context to send to the same child session."""
+        if not 0 < len(answer.strip()) <= RECOVERY_CONTEXT_MAX:
+            raise ValueError(f"recovery context answer must contain 1 to {RECOVERY_CONTEXT_MAX} characters")
+        with self._lock:
+            monitor = self.fault_monitor
+            attempt = monitor.recovery
+            if attempt is None or attempt["id"] != recovery_id:
+                raise ValueError("recovery is no longer active")
+            request = attempt.get("contextRequest")
+            if request is None or request["id"] != request_id:
+                raise ValueError("recovery context request is no longer pending")
+            if attempt["contextOwner"] != parent_id:
+                raise ValueError("answer the recovery context request from its original EH session")
+            actions, observations = monitor.diagnosis_history(recovery_id, attempt["phase"])
+            review = attempt.get("review")
+            if review is not None:
+                observations = self._recovery_inspections(observations)
+                known = {row["ref"]: row for row in review["observations"] + observations}
+                review["observations"] = sorted(known.values(), key=lambda row: row["sequence"])[-monitor.config.history_limit:]
+                observations = review["observations"]
+            attempt.pop("contextRequest")
+            attempt.pop("contextOwner")
+            return {"childId": attempt["childId"], "reviewId": review["id"] if review else None,
+                    "completionReview": review is not None and review["completion"] is not None,
+                    "evidence": {"request": copy.deepcopy(request), "answer": answer.strip(),
+                                 "actions": actions, "observations": copy.deepcopy(observations)}}
+
+    @staticmethod
+    def _recovery_inspections(observations: list[dict]) -> list[dict]:
+        return [{"ref": f'inspection-{row["sequence"]}', **row} for row in observations]
+
+    def _recovery_scene(self) -> dict:
+        tracks = sorted(self.estimator.tracks.values(), key=lambda track: track.last_seen, reverse=True)[:32]
+        return {"source": "Ego-State estimate", "stamp": self.estimator.stamp,
+                "objects": [{"entity": track.id, "category": track.category, "position": track.pos.tolist(),
+                             "observedAt": track.last_seen, "held": track.held,
+                             "on": support.id if (support := self.estimator.support_of(track)) else None}
+                            for track in tracks]}
+
+    def begin_task_recovery_review(self, task: str, claim: str, child_id: str) -> dict:
+        """Open a read-only review of the operator task and the latched fault."""
+        with self._lock:
+            monitor = self.fault_monitor
+            if monitor.transition is None:
+                return monitor.status()
+            attempt = monitor.recovery
+            if attempt is not None:
+                if request := attempt.get("contextRequest"):
+                    return {**monitor.status(), "needsContext": True, "request": copy.deepcopy(request)}
+                if attempt["phase"] != "verifying":
+                    return {**monitor.status(), "reason": "another recovery turn is active"}
+                recovery_id = attempt["id"]
+            else:
+                if monitor.required_diagnosis is not None:
+                    return {**monitor.status(), "reason": "the repeated action requires diagnosis before review"}
+                running = self.executor.current
+                if running is not None and running.is_running:
+                    return {**monitor.status(), "reason": "wait for the active skill to finish"}
+                recovery_id = None
+        if recovery_id is None:
+            recovery_id = self.begin_recovery(None, task, task_review=True)["id"]
+            with self._lock:
+                self.fault_monitor.finish_diagnosis(recovery_id, self.estimator.stamp, True)
+        return self.begin_recovery_review(recovery_id, [], {"task": task, "claim": claim}, child_id)
+
+    def begin_recovery_review(self, recovery_id: str, references: list[str],
+                              completion: dict | None = None, child_id: str | None = None) -> dict:
+        """Reserve a review and capture robot evidence after the latest recorded activity."""
+        with self._lock:
+            monitor = self.fault_monitor
+            attempt = monitor.require_recovery(recovery_id, "verifying")
+            job = self.executor.current
+            if job is not None and job.is_running:
+                return {**monitor.status(), "verified": False, "reason": "wait for the active skill to finish"}
+            generation = self._generation
+            review_id = f"review-{next(self._recovery_ids)}"
+            last_action = monitor.actions[-1] if monitor.actions else None
+            latest_finish = last_action["finished"] if last_action else 0
+            review = {"id": review_id, "captures": {},
+                      "completion": completion, "childId": attempt.get("childId") or child_id,
+                      "runningJobId": job.id if job else None,
+                      "lastJob": last_action["sequence"] if last_action else None,
+                      "after": max(latest_finish, monitor.transition["stamp"] if completion else attempt["diagnosisFinished"])}
+            attempt.update(phase="reviewing", review=review)
+        try:
+            packet = self._recovery_packet(generation)
+            with self._lock:
+                attempt, review = self._recovery_scope(recovery_id, review_id)
+                if generation != self._generation:
+                    raise ValueError("robot episode changed during recovery review")
+                review["captures"]["post"] = packet
+                actions = [a for a in monitor.actions if a["sequence"] > attempt["diagnosisSequence"]][-12:]
+                fault = attempt["faultJob"]
+                evidence_actions, evidence_faces = monitor.diagnosis_history(recovery_id, "reviewing") if completion else ([], [])
+                review["jobRefs"] = {a["job"] for a in actions + evidence_actions}
+                if fault is not None:
+                    review["jobRefs"].add(fault["job"])
+                observations = self._recovery_inspections(evidence_faces if completion else list(monitor.observations)[-16:])
+                review["observations"] = observations
+                if completion:
+                    self._log("state", "RECOVERY：开始任务收尾复核")
+                return {"id": recovery_id, "reviewId": review_id, "childId": review["childId"],
+                        "newChild": attempt.get("childId") is None,
+                        "evidence": copy.deepcopy({"fault": monitor.transition, "faultJob": fault,
+                         "diagnosis": attempt["diagnosis"],
+                         "baseline": self._recovery_packet_metadata("baseline", attempt["sensor"]),
+                         "post": self._recovery_packet_metadata("post", packet),
+                         "referenceBacks": references, "inspections": observations, "actionsSinceDiagnosis": actions,
+                         **({"taskCompletion": completion, "faultHistory": evidence_actions,
+                             "scene": self._recovery_scene()} if completion else {})})}
+        except Exception:
+            with self._lock:
+                if monitor.recovery is attempt and attempt.get("review", {}).get("id") == review_id:
+                    self._end_recovery_review(attempt)
+            raise
+
+    @staticmethod
+    def _end_recovery_review(attempt: dict) -> None:
+        attempt.pop("review")
+        attempt.pop("contextRequest", None)
+        attempt.pop("contextOwner", None)
+        attempt["phase"] = "verifying"
+
+    def _recovery_review_reason(self, attempt: dict, review: dict, report: dict, stamp: float | None) -> str:
+        """Check whether the Agent verdict cites current robot evidence."""
+        if report["verdict"] != "resolved":
+            return report["reason"]
+        if review["completion"] is not None and report.get("taskCompleted") is not True:
+            return "task completion has not been verified"
+        monitor = self.fault_monitor
+        if stamp is None:
+            return "live robot feedback is unavailable"
+        running = self.executor.current
+        latest_job = monitor.actions[-1]["sequence"] if monitor.actions else None
+        if (latest_job != review["lastJob"] or (running.id if running else None) != review["runningJobId"]
+                or (running is not None and running.is_running)):
+            return "robot activity changed during the review"
+        captures = review["captures"]
+        observations = {o["ref"]: o for o in review["observations"]}
+        cited = set(report["evidence"])
+        allowed = {"baseline"} | attempt["captures"].keys() | captures.keys() | observations.keys() | review["jobRefs"]
+        if "baseline" not in cited or not cited <= allowed:
+            return "review must cite the baseline and use evidence references from this review"
+
+        def fresh(observation: dict | None) -> bool:
+            return (observation is not None and observation["stamp"] >= review["after"]
+                    and 0 <= stamp - observation["stamp"] <= monitor.config.recovery_observation_s)
+
+        if any(fresh(captures[ref].get(sensor)) for ref in cited & captures.keys() for sensor in ("body", "camera")):
+            return ""
+        after_sequence = latest_job or 0
+        if review["completion"] is None:
+            after_sequence = max(attempt["diagnosisSequence"], after_sequence)
+        if any(observations[ref]["sequence"] > after_sequence and fresh(observations[ref])
+               for ref in cited & observations.keys()):
+            return ""
+        return "review must cite fresh robot sensor or inspection evidence"
+
+    def finish_recovery_review(self, recovery_id: str, review_id: str, report: dict | None) -> dict:
+        """Apply the Agent verdict only while its robot evidence still applies."""
+        with self._lock:
+            attempt, review = self._recovery_scope(recovery_id, review_id)
+            if report is None:
+                self._end_recovery_review(attempt)
+                return self.fault_monitor.status()
+            self._require_answered_recovery_context(attempt)
+            generation = self._generation
+        try:
+            body = self.link.sensors()
+        except (HttpError, OSError, TimeoutError):
+            body = None
+        with self._lock:
+            attempt, review = self._recovery_scope(recovery_id, review_id)
+            stamp = body["stamp"] if body is not None and self._same_episode(generation, body) else None
+            reason = self._recovery_review_reason(attempt, review, report, stamp)
+            if reason:
+                attempt["childId"] = review["childId"]
+                attempt["lastReview"] = copy.deepcopy(report)
+                self._log("state", f"RECOVERY：复核暂未通过。{reason}")
+                self._end_recovery_review(attempt)
+            else:
+                self.fault_monitor.resolve(recovery_id, stamp, report)
+                self._log("state", "NORMAL：故障恢复复核通过")
+            return {**self.fault_monitor.status(), "verified": not reason, "reason": reason, "review": report}
+
     def _log(self, kind: str, text: str) -> None:
         """Append to the activity record the console shows below the Ego-State view: ``step``,
         ``difficulty``, ``state``, ``skill``, ``alert`` and ``reflection`` entries, newest last."""
@@ -2022,7 +2503,29 @@ class EgoRuntime:
         print(f"ego: pick plan for {target} re-docked after a {moved * 100:.0f} cm correction",
               file=sys.stderr, flush=True)
 
-    def _skill_finished(self, job) -> None:
+    def _skill_finished(self, job: Job) -> None:
+        with self._lock:
+            if job.episode_generation == self._generation and job.finished is not None:
+                receipt = self.receipts.get(job.receipt, {})
+                plan = receipt.get("plan", {})
+                operation, target, params = self._action_identity(job.skill, receipt)
+                postcondition = job.postcondition or {}
+                track = self.estimator.tracks.get(target)
+                grasp = track.grasp_association if track is not None and track.id == self.estimator.held_id else None
+                action = {"job": job.id, "receipt": job.receipt, "skill": job.skill,
+                          "operation": operation, "target": target,
+                          "params": copy.deepcopy(params), "outcome": job.state, "message": job.message,
+                          "started": job.started, "finished": job.finished,
+                          "plan": {key: copy.deepcopy(plan[key]) for key in
+                                   ("support", "spot", "floor", "dock", "predock", "targetP", "graspOffset") if key in plan},
+                          "execution": {"log": job.log[-20:], "stages": copy.deepcopy(list(job.execution_stages))},
+                          "before": job.feedback_before, "after": job.feedback_after,
+                          "graspIdentityVerified": bool(grasp and grasp.get("identityVerified")),
+                          "postcondition": {key: copy.deepcopy(postcondition[key]) for key in
+                                            ("ok", "status", "releaseExecuted", "releasedAt", "expectedXYM",
+                                             "observation", "deltaXYM") if key in postcondition}}
+                if self.fault_monitor.record(action):
+                    self._log("state", f"DEGRADED：检测到重复操作 {action['operation']} {target or ''}".rstrip())
         result = {"succeeded": "完成", "failed": "失败", "stopped": "被停止"}.get(job.state, job.state)
         self._log("skill", f"{job.skill} {result}" + (f"：{job.message}" if job.state != "succeeded" else ""))
 
@@ -2249,7 +2752,7 @@ class EgoRuntime:
         from steward.ego.assemble import AssembleOnto
         AssembleOnto(self).run(job, plan)
 
-    def _consume_receipt(self, receipt):
+    def _consume_receipt(self, receipt, *, check_diagnosis: bool = False):
         receipt_id = receipt['id']
         if self._receipt_generation.get(receipt_id) != self._generation:
             raise PermissionError('receipt belongs to a different sensor session')
@@ -2263,19 +2766,43 @@ class EgoRuntime:
         limit = receipt.get("maxRisk", self.config.max_risk)
         if receipt["risk"] > limit:
             raise PermissionError(f"receipt risk {receipt['risk']:.2f} exceeds the limit {limit:.2f}")
+        if check_diagnosis:
+            self._check_motion_diagnosis(receipt["skill"], receipt)
         receipt["used"] = True
         return receipt['plan']
 
     def run(self, receipt_id: str, owner: str | None = None) -> dict:
         """Execute a predicted plan. The runtime re-checks the receipt here, where the motion happens."""
         self._check_control(owner)
-        receipt = self.receipt(receipt_id)
-        self._consume_receipt(receipt)
-        job = self.executor.start(receipt["skill"], receipt).to_dict()
+        with self._lock:
+            receipt = self.receipt(receipt_id)
+            self._consume_receipt(receipt, check_diagnosis=True)
+            job = self.executor.start(receipt["skill"], receipt, episode_generation=self._generation).to_dict()
         params = receipt.get("params") or {}
         target = params.get("target") or params.get("on") or (f"({params['x']:.2f}, {params['y']:.2f})" if "x" in params else "")
         self._log("skill", f"{receipt['skill']} 开始" + (f"：{target}" if target else ""))
         return job
+
+    @staticmethod
+    def _action_identity(skill: str, receipt: dict) -> tuple[str, str | None, dict]:
+        params, plan = receipt.get("params", {}), receipt.get("plan", {})
+        operation = "flip" if skill == "place" and params.get("flip") is True else skill
+        target = plan.get("object") or plan.get("target") or params.get("target") or params.get("body")
+        return operation, target, params
+
+    def _check_motion_diagnosis(self, skill: str, receipt: dict) -> None:
+        monitor = self.fault_monitor
+        running = self.executor.current
+        if running is not None and running.is_running:
+            raise RuntimeError(f"skill {running.skill} ({running.id}) is still running")
+        stamp = max(self.estimator.stamp, monitor.actions[-1]["finished"]) if monitor.actions else self.estimator.stamp
+        was_pending = monitor.required_diagnosis is not None
+        required = monitor.require_diagnosis_for(stamp, *self._action_identity(skill, receipt))
+        if required is not None:
+            if not was_pending:
+                self._log("state", f"DEGRADED：重复动作 {required['operation']} 需要先诊断（{required['job']}）")
+            raise HttpError(409, "Robot motion is paused until the recovery subagent submits a diagnosis.",
+                            code="diagnosis_required")
 
     def explore(self, owner: str | None = None) -> dict:
         """Look around in place. Rotation without translation needs no receipt.
@@ -2284,7 +2811,10 @@ class EgoRuntime:
         into, and closed afterwards. Those visits are planned from the ego state at the time and
         skipped when they are not feasible."""
         self._check_control(owner)
-        return self.executor.start("look_around", {"id": "look-around", "plan": {}}).to_dict()
+        receipt = {"id": "look-around", "plan": {}}
+        with self._lock:
+            self._check_motion_diagnosis("look_around", receipt)
+            return self.executor.start("look_around", receipt, episode_generation=self._generation).to_dict()
 
     def _closed_drawer_ids(self) -> list[str]:
         """Closed pullable drawers already seen enough times to open, nearest first."""

@@ -110,6 +110,7 @@ class Track:
     observations: int
     first_seen: float
     last_seen: float
+    object_ref: str | None = None  # episode-local reference from an ideal detection
     existence: float = 0.5
     held: bool = False
     held_offset: np.ndarray | None = None  # while held: its centre from the pinch point, in the gripper's frame
@@ -594,7 +595,8 @@ class EgoEstimator:
         # object yields at most one detection per camera, so a track takes one from each camera.
         pairs = []
         for k, (det, pos, _yaw, sigma, _q) in enumerate(measurements):
-            for track in self._candidates(det["category"], pos, sigma, float(max(det["size"][0], det["size"][1]))):
+            for track in self._candidates(det["category"], pos, sigma, float(max(det["size"][0], det["size"][1])),
+                                          det.get("objectRef")):
                 pairs.append((float(np.linalg.norm(track.pos - pos)), k, track.id))
         camera_of = [det.get("camera", self.primary_camera) for det, _p, _y, _s, _q in measurements]
         seen_by: dict[str, set[str]] = {c: set() for c in cams}
@@ -610,7 +612,8 @@ class EgoEstimator:
                 continue
             # Another camera's view of an object first seen in this very frame joins the track its
             # first view started.
-            born = [t for t in self._candidates(det["category"], pos, sigma, float(max(det["size"][0], det["size"][1])))
+            born = [t for t in self._candidates(det["category"], pos, sigma, float(max(det["size"][0], det["size"][1])),
+                                               det.get("objectRef"))
                     if t.first_seen == self.stamp and t.id not in seen_by[camera_of[k]]]
             if born:
                 twin = min(born, key=lambda t: float(np.linalg.norm(t.pos - pos)))
@@ -623,8 +626,10 @@ class EgoEstimator:
             if entry == "carried":
                 # Contents slide about in a container being carried and tipped: a view of one is first
                 # taken for a known content beyond the association gate, not for another object.
+                ref = det.get("objectRef")
                 slid = [t for t in self.tracks.values()
-                        if t.carried and t.id not in seen_by[camera_of[k]] and compatible(t.category, det["category"])]
+                        if t.carried and t.id not in seen_by[camera_of[k]] and compatible(t.category, det["category"])
+                        and (ref is None or t.object_ref in (None, ref))]
                 if slid:
                     nearest = min(slid, key=lambda t: float(np.linalg.norm(t.pos - pos)))
                     self._fuse(nearest, det, pos, yaw, sigma, quat=quat)
@@ -4255,11 +4260,14 @@ class EgoEstimator:
         offset = float(np.linalg.norm(np.asarray(xy_a)[:2] - np.asarray(xy_b)[:2]))
         return offset <= NEST_CENTER_SHARE * min(foot_a, foot_b) / 2
 
-    def _candidates(self, category: str, pos: np.ndarray, sigma: float, footprint: float | None = None) -> list[Track]:
-        """Tracks a detection may belong to: a compatible category, a matching size and within the gate."""
+    def _candidates(self, category: str, pos: np.ndarray, sigma: float, footprint: float | None = None,
+                    object_ref: str | None = None) -> list[Track]:
+        """Gate by category, size, distance, and any known ideal detection identity."""
         out = []
         for track in self.tracks.values():
             if not compatible(category, track.perceived_category):
+                continue
+            if object_ref is not None and track.object_ref not in (None, object_ref):
                 continue
             if footprint is not None and not track.held and not self._size_match(footprint, track.footprint):
                 continue
@@ -4290,6 +4298,8 @@ class EgoEstimator:
                 drop = self.tracks.get(drop_id)
                 if drop is None or drop.held or drop.carried or not compatible(drop.perceived_category,
                                                                                keep.perceived_category):
+                    continue
+                if keep.object_ref is not None and drop.object_ref not in (None, keep.object_ref):
                     continue
                 if _small_observations_apart(keep.span, drop.span):
                     continue
@@ -4330,6 +4340,7 @@ class EgoEstimator:
                 keep.observations += drop.observations
                 keep.existence = max(keep.existence, drop.existence)
                 keep.last_seen = max(keep.last_seen, drop.last_seen)
+                keep.object_ref = keep.object_ref or drop.object_ref
                 _absorb_hardware_views(keep, drop)
                 self._drop(drop, "merged: duplicate", into=keep)
 
@@ -4346,6 +4357,7 @@ class EgoEstimator:
             observations=1,
             first_seen=self.stamp,
             last_seen=self.stamp,
+            object_ref=det.get("objectRef"),
             color_counts={det["color"]: 1.0} if det.get("color") else {},
         )
         self._remember_screw_holes(track, det, pos, yaw)
@@ -4470,6 +4482,7 @@ class EgoEstimator:
 
     def _fuse(self, track: Track, det: dict, pos: np.ndarray, yaw: float, sigma: float,
               quat: list[float] | None = None) -> None:
+        track.object_ref = track.object_ref or det.get("objectRef")
         track.category_counts[det["category"]] = track.category_counts.get(det["category"], 0.0) + 1.0
         if det.get("color"):
             track.color_counts[det["color"]] = track.color_counts.get(det["color"], 0.0) + 1.0
@@ -4608,7 +4621,7 @@ class EgoEstimator:
 
     # ---------------------------------------------------------------- holding
     def mark_held(self, track_id: str, since: float | None = None, gripper: str | None = None,
-                  at: list[float] | None = None, body: dict | None = None) -> str:
+                  at: list[float] | None = None, body: dict | None = None, *, identity_verified: bool = False) -> str:
         """Record the grasp, and carry its load with the arm, together with what lies in it.
 
         ``since`` is the body's clock at the moment the gripper closed: a frame rendered before
@@ -4630,6 +4643,7 @@ class EgoEstimator:
         without looks, so it is dropped here. If the tracked object was merged away during the
         approach, the track nearest the gripper takes the load instead.
 
+        :param identity_verified: whether the caller matched the gripper feedback to the target.
         :returns: the id of the held track.
         :raises KeyError: no track is near the gripper."""
         requested_id = track_id
@@ -4665,7 +4679,7 @@ class EgoEstimator:
             "positionAtGrasp": track.pos.tolist(), "gripperAtGrasp": closed_at.tolist(),
             "observedAt": float(track.last_seen), "recordedAt": float(self.stamp),
             "distanceToGripperM": float(np.linalg.norm(track.pos - closed_at)),
-            "source": "ego_track_before_transport", "identityVerified": False,
+            "source": "ego_track_before_transport", "identityVerified": identity_verified,
             **({"protectedObservedAgeS": track.pin_observed_age}
                if track.pinned and track.pin_observed_age is not None else {}),
         }

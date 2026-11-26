@@ -45,7 +45,7 @@
 - id: ptc-runtime
   config:
     executionMode: persistent-in-memory
-    timeoutMs: 300000
+    timeoutMs: 480000
     maxTimeoutMs: 600000
 
 # The robot perceives and acts only through ctx.ego. General computer tools inherited from

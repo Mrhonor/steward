@@ -607,6 +607,7 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('agent/request', async ({ agent }, next): Promise<LlmCallConfig> => {
     const proposed = await next()
+    if (agent.session.header.origin === 'subagent') return proposed
     const kind = stateOf(agent).next
     const effort = kind === undefined ? '' : config.effort[kind]
     return effort ? { ...proposed, reasoningEffort: ReasoningEffortId(effort) } : proposed

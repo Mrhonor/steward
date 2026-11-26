@@ -6,6 +6,8 @@ import numpy as np
 from steward.math3d import matrix_from_quat, pose_compose, quat_from_axis_angle
 
 CAMERA_AXES = "opencv_x_right_y_down_z_forward"
+BASE_AXES = "x_forward_y_left_z_up"
+_MOUNT_FROM_OPENCV = np.array([[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
 
 
 def _link_pose(model: dict, encoders: dict, link: str) -> dict:
@@ -44,19 +46,33 @@ def _matrix(pose: dict) -> np.ndarray:
     return result
 
 
-def reference_to_odometry(model: dict, packet: dict) -> np.ndarray:
-    """Map middle OpenCV camera points into the robot's measured odometry frame at this sample."""
-    odom = packet["odometry"]
+def camera_to_base(model: dict, encoders: dict, camera: str) -> np.ndarray:
+    """Map a camera's OpenCV points into the robot base at the encoder sample."""
+    mount = next(((link["id"], sensor["mount"]) for link in model["body"]["links"]
+                  for sensor in link.get("sensors", []) if sensor["id"] == camera), None)
+    if mount is None:
+        raise ValueError(f"Robot model has no camera {camera!r}")
+    link, offset = mount
+    return _matrix(pose_compose(_link_pose(model, encoders, link), offset)) @ _MOUNT_FROM_OPENCV
+
+
+def base_to_odometry(odom: dict) -> np.ndarray:
+    """Map robot base points into the frame reported by planar odometry."""
     if any(type(odom.get(key)) not in (int, float) or not math.isfinite(odom[key]) for key in ("x", "y", "yaw")):
         raise ValueError("Missing or invalid synchronized robot odometry")
-    camera_link, camera = next((link["id"], sensor) for link in model["body"]["links"]
-                               for sensor in link.get("sensors", []) if sensor["id"] == "head_camera")
-    camera_base = _matrix(pose_compose(_link_pose(model, packet["joint_encoders"], camera_link), camera["mount"]))
-    flu_from_cv = np.array([[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
     yaw = odom["yaw"]
-    base_odom = np.array([[math.cos(yaw), -math.sin(yaw), 0, odom["x"]],
-                          [math.sin(yaw), math.cos(yaw), 0, odom["y"]], [0, 0, 1, 0], [0, 0, 0, 1]])
-    return base_odom @ camera_base @ flu_from_cv
+    return np.array([[math.cos(yaw), -math.sin(yaw), 0, odom["x"]],
+                     [math.sin(yaw), math.cos(yaw), 0, odom["y"]], [0, 0, 1, 0], [0, 0, 0, 1]])
+
+
+def reference_to_odometry(model: dict, packet: dict) -> np.ndarray:
+    """Map middle OpenCV camera points into the robot's measured odometry frame at this sample."""
+    return base_to_odometry(packet["odometry"]) @ camera_to_base(model, packet["joint_encoders"], "head_camera")
+
+
+def gripper_to_base(model: dict, encoders: dict, gripper: str) -> np.ndarray:
+    """Map gripper-link points into the robot base using its raw joint encoders."""
+    return _matrix(_link_pose(model, encoders, gripper))
 
 
 def grasp_link(model: dict) -> str:
@@ -83,12 +99,8 @@ def gripper_pose(model: dict, packet: dict, gripper: str | None = None, joints: 
             or "head_camera" not in packet["views"]):
         raise ValueError("Invalid robot kinematics packet")
     encoders = packet["joint_encoders"]
-    gripper_to_base = _matrix(_link_pose(model, encoders, gripper))
-    camera_link, camera = next((link["id"], sensor) for link in model["body"]["links"]
-                               for sensor in link.get("sensors", []) if sensor["id"] == "head_camera")
-    reference_to_base = _matrix(pose_compose(_link_pose(model, encoders, camera_link), camera["mount"]))
-    flu_from_cv = np.array([[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
-    reference_to_base = reference_to_base @ flu_from_cv
+    gripper_base = gripper_to_base(model, encoders, gripper)
+    reference_to_base = camera_to_base(model, encoders, "head_camera")
     relative = {}
     for camera_id in packet["views"]:
         camera_to_reference = np.asarray(packet["views"][camera_id]["camera_to_reference"], dtype=float)
@@ -97,9 +109,9 @@ def gripper_pose(model: dict, packet: dict, gripper: str | None = None, joints: 
                 or not np.allclose(camera_to_reference[:3, :3].T @ camera_to_reference[:3, :3], np.eye(3))
                 or not np.isclose(np.linalg.det(camera_to_reference[:3, :3]), 1)):
             raise ValueError("Invalid camera rig calibration")
-        relative[camera_id] = (np.linalg.inv(reference_to_base @ camera_to_reference) @ gripper_to_base).tolist()
+        relative[camera_id] = (np.linalg.inv(reference_to_base @ camera_to_reference) @ gripper_base).tolist()
     return {"stamp": packet["stamp"], "pose_source": "joint_encoders_and_robot_model",
-            "gripper_frame": "gripper", "gripper_link": gripper, "gripper_axes": "x_forward_y_left_z_up",
+            "gripper_frame": "gripper", "gripper_link": gripper, "gripper_axes": BASE_AXES,
             "camera_axes": CAMERA_AXES, "joint_positions": dict(encoders if joints is None else joints),
-            "gripper_to_base": gripper_to_base.tolist(),
+            "gripper_to_base": gripper_base.tolist(),
             "gripper_to_camera": relative}

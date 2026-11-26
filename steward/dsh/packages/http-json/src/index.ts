@@ -5,7 +5,7 @@
 
 /** Non-2xx response, unreachable service or expired deadline. */
 export class HttpJsonError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(message: string, readonly status?: number, readonly code?: string) {
     super(message)
     this.name = 'HttpJsonError'
   }
@@ -78,7 +78,9 @@ export async function requestJson<T>(base: string, method: 'GET' | 'POST', path:
     const message = typeof parsed === 'object' && parsed !== null && 'error' in parsed
       ? String((parsed as { error: unknown }).error)
       : `HTTP ${response.status}`
-    throw new HttpJsonError(message, response.status)
+    const code = typeof parsed === 'object' && parsed !== null && 'code' in parsed && typeof parsed.code === 'string'
+      ? parsed.code : undefined
+    throw new HttpJsonError(message, response.status, code)
   }
   return parsed as T
 }

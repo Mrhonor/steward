@@ -25,6 +25,7 @@ from steward.ego.estimator import Appearance, EgoEstimator, Track
 from steward.ego.perception import face_colour_stats, top_face
 from steward.ego.runtime import EgoRuntime, RobotLink
 from steward.ego.server import ego_api
+from steward.ego.skills import GraspIdentityFailed
 from steward.math3d import quat_rotate, wrap_angle
 from steward.mission import _approach_to_observe, _explore
 from steward.net import call
@@ -134,6 +135,44 @@ def test_a_pourable_box_is_grasped_with_its_contents_only_without_its_lid_and_ca
     assert rise > 0.08
     assert all(sim._entity_pose(f"w:piece-{r}{c}")["p"][2] - box[2] > 0.08 for r in range(3) for c in range(3)), \
         "the pieces rise with the box"
+
+
+def test_ego_rejects_the_lid_when_the_pick_target_is_the_dog_puzzle_box(kitchen_root, monkeypatch):
+    sim = WorldSim(_scenario(kitchen_root, "puzzle-dog")["sceneState"])
+    robot = "w:robot-1"
+    box = sim._entity_pose("w:box")["p"]
+    reach = 0.45
+    sim.command(robot, {"base": [box[0] - (0.26 + reach), box[1], 0.0], "lift": box[2] + 0.03, "reach": reach})
+    sim.step_seconds(4.0)
+    monkeypatch.setattr(sim, "_visible", lambda *args: True)
+    link = RobotLink("http://unused")
+    monkeypatch.setattr(link, "sensors", lambda: sim.sensors(robot))
+    runtime = EgoRuntime(link, steward_bot().to_dict())
+    frame = link.sensors()
+    runtime.estimator.update(frame)
+    target = next(track for track in runtime.estimator.tracks.values() if track.category == "box")
+    lid = next(track for track in runtime.estimator.tracks.values() if track.category == "lid")
+    assert target.object_ref is not None
+    assert frame["gripper"]["heldObjectRef"] is None
+
+    sim.command(robot, {"gripper": "close"})
+    sim.step_seconds(0.2)
+    assert sim.robots[robot].attached == "w:lid"
+    with pytest.raises(GraspIdentityFailed, match=f"expected {target.id}, actual track {lid.id}"):
+        runtime._mark_held(target.id)
+    assert runtime.estimator.held_id is None and not target.held
+
+    sim.command(robot, {"gripper": "open"})
+    sim.edit_move("w:lid", {"at": {"x": 2.0, "y": 1.5}})
+    sim.command(robot, {"lift": box[2] + 0.025})
+    sim.step_seconds(1.0)
+    sim.command(robot, {"gripper": "close"})
+    sim.step_seconds(0.2)
+    assert sim.robots[robot].attached == "w:box"
+    assert link.sensors()["gripper"]["heldObjectRef"] == target.object_ref
+    assert runtime._mark_held(target.id) == target.id
+    assert target.grasp_association["identityVerified"] is True
+    assert target.object_ref not in json.dumps(runtime.estimator.to_scene().to_dict())
 
 
 def test_fingers_take_a_piece_beside_the_box_wall_the_box_by_its_rim_and_nothing_through_a_lid(kitchen_root):
@@ -320,7 +359,9 @@ def test_the_robot_takes_off_the_lid_and_pours_the_pieces_out_onto_the_table(kit
         objects = {o["id"]: (o["category"], o["position"], o["sizeM"]) for o in call("GET", f"{api.url}/ego/summary")["objects"]}
         assert receipt["withinRiskLimit"], (skill, receipt["issues"], objects)
         job = call("POST", f"{api.url}/skill/run", {"receipt": receipt["id"]})
-        return call("POST", f"{api.url}/skill/wait", {"job": job["id"], "timeoutS": 120}, timeout=130)["state"]
+        result = call("POST", f"{api.url}/skill/wait", {"job": job["id"], "timeoutS": 120}, timeout=130)
+        assert result["state"] == "succeeded", (skill, result)
+        return result["state"]
 
     def flow():
         try:

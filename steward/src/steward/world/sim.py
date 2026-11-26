@@ -41,6 +41,7 @@ from steward.world.odometry import OdometryTrack
 _COLLISION_GROUPS = np.array([1, 0, 0, 1, 0, 0], dtype=np.uint8)
 HIDDEN_GROUP = 4  # not drawn by MuJoCo's default visualisation options
 HOLD_LEASE_S = 2.0  # wall seconds a hold may go unseen (its owner neither waiting nor done) before the world ignores it
+RECOVERY_PAUSE_LEASE_S = 10.0
 _JOINT_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3),
                 int(mujoco.mjtJoint.mjJNT_SLIDE): (1, 1), int(mujoco.mjtJoint.mjJNT_HINGE): (1, 1)}
 # Shared by every simulation of the process, so a newly loaded scenario never repeats a number.
@@ -267,6 +268,7 @@ class WorldSim:
     # ------------------------------------------------------------------ setup
     def _load(self, scene_dict: dict) -> None:
         self.episode = next(_EPISODES)
+        self._ideal_object_refs: dict[tuple[str, str], str] = {}
         self.template = SceneState.from_dict(scene_dict)
         cameras = [self._overview or self._default_overview()]
         self.build: MjcfBuild = build_mjcf(self.template, timestep=self.timestep, extra_cameras=cameras,
@@ -280,6 +282,7 @@ class WorldSim:
         self._epoch = getattr(self, "_epoch", 0) + 1
         self.odometry_frame_id = uuid.uuid4().hex
         self._holds: dict[str, _Hold] = {}
+        self._recovery_pauses: dict[str, float] = {}
         self._renderers: dict[tuple[int, int], mujoco.Renderer] = {}
         self._index_bodies()
         self._fastening = Fastening(self)
@@ -585,13 +588,14 @@ class WorldSim:
             with self._clock:
                 now, epoch = self.time, self._epoch
                 idle = self.freeze_idle and not self._pulled()
-                if self.paused or idle or self.speed != speed0 or epoch != epoch0:
+                paused = self.paused or self._recovery_clock_paused()
+                if paused or idle or self.speed != speed0 or epoch != epoch0:
                     wall0, sim0, speed0, epoch0 = time.perf_counter(), now, self.speed, epoch
                 n = min(self.max_batch, self._hold_limit() - self._step_now())
                 if speed0 != math.inf:
                     n = min(n, self._step_index(sim0 + (time.perf_counter() - wall0) * speed0) - self._step_now())
-                if self.paused or idle or n <= 0:
-                    self._clock.wait(0.01 if self.paused else 0.001)
+                if paused or idle or n <= 0:
+                    self._clock.wait(0.01 if paused else 0.001)
                     continue
                 self.step(n)
                 self._clock.notify_all()
@@ -600,6 +604,26 @@ class WorldSim:
             time.sleep(0)
 
     # ------------------------------------------------------------------ clock
+    def recovery_clock(self, owner: str, action: str, episode: int | None = None) -> None:
+        """Lease a physics pause that leaves robot-port reads and clock calls due now available."""
+        with self._clock:
+            if action == "release":
+                self._recovery_pauses.pop(owner, None)
+            else:
+                if episode is not None and episode != self.episode:
+                    raise ValueError("recovery clock belongs to a previous episode")
+                self._recovery_clock_paused()
+                if action == "renew" and owner not in self._recovery_pauses:
+                    raise ValueError("recovery clock pause has expired")
+                self._recovery_pauses[owner] = time.monotonic() + RECOVERY_PAUSE_LEASE_S
+            self._clock.notify_all()
+
+    def _recovery_clock_paused(self) -> bool:
+        if self._recovery_pauses:
+            now = time.monotonic()
+            self._recovery_pauses = {owner: until for owner, until in self._recovery_pauses.items() if until > now}
+        return bool(self._recovery_pauses)
+
     def wait_until(self, t: float | None = None, hold: str | None = None, timeout: float | None = None,
                    rank: int = 0, seconds: float = 0.0, pulls: bool = True) -> float:
         """Block until the world reaches ``t`` (``None``: ``seconds`` from now); return the simulated time
@@ -1071,7 +1095,8 @@ class WorldSim:
         """One sensor frame for a robot: odometry, joint encoders, gripper, its cameras and, without
         raw imaging, the ideal detections of every camera (each carries the ``camera`` it came from
         and a pose relative to it; an object two cameras see is reported by the first).
-        ``episode`` changes with every load and reset, which the robot experiences as a reboot."""
+        Ideal detections carry an opaque ``objectRef`` shared with the grasped object's
+        ``heldObjectRef`` on the gripper. References are local to a robot and episode."""
         with self.lock:
             rs = self._robot(robot_id)
             names = self.build.names[robot_id]
@@ -1097,6 +1122,10 @@ class WorldSim:
                 frame["imaging"] = "rgbd"
                 frame["masks"] = self.perception.masks
             else:
+                for lid, g in rs.grippers.items():
+                    grips[lid]["heldObjectRef"] = (
+                        self._ideal_object_ref(robot_id, g.attached) if g.attached is not None else None
+                    )
                 seen: set = set()
                 frame["detections"] = [det for c in cameras
                                        for det in self._detections(robot_id, *self.camera_pose(robot_id, c["id"]), seen,
@@ -1151,7 +1180,9 @@ class WorldSim:
         the synthetic channel (see :mod:`steward.world.realseg`); each frame is long-polled and
         served exactly once, and the segmenter observes the primary camera. See :meth:`_rgbd_render`
         for the frame format."""
-        segmenter = self._realseg(robot_id)
+        with self.lock:
+            stopped_for_recovery = self._recovery_clock_paused()
+        segmenter = None if stopped_for_recovery else self._realseg(robot_id)
         if segmenter is not None:
             blob = segmenter.get(timeout - 2.0)
             if blob is not None:
@@ -1275,8 +1306,8 @@ class WorldSim:
         for ent in self.template.entities:
             if ent.id == robot_id:
                 continue
-            for _, links, category in self.perception_parts(ent):
-                yield ent, links, category
+            for part_id, links, category in self.perception_parts(ent):
+                yield ent, part_id, links, category
 
     def _appearance(self, ent, links: list[str] | None) -> tuple[str, float]:
         """Colour name and opacity of a part, from its largest collision geom."""
@@ -1289,6 +1320,13 @@ class WorldSim:
         rgba = self.model.geom_rgba[big]
         return color_name(rgba), float(rgba[3])
 
+    def _ideal_object_ref(self, robot_id: str, part_id: str) -> str:
+        """Return an episode-local reference without exposing the World State ID."""
+        key = (robot_id, part_id)
+        if key not in self._ideal_object_refs:
+            self._ideal_object_refs[key] = uuid.uuid4().hex
+        return self._ideal_object_refs[key]
+
     def _detections(self, robot_id: str, cam_pose: dict, sensor: dict, seen: set, rng: np.random.Generator) -> list[dict]:
         """Detections of one camera, skipping the parts in ``seen`` and adding those it reports."""
         p = self.perception
@@ -1300,7 +1338,7 @@ class WorldSim:
         cam_p = np.asarray(cam_pose["p"])
         robot_base = self._root_body(robot_id)
         dets = []
-        for ent, links, category in self._detection_targets(robot_id):
+        for ent, part_id, links, category in self._detection_targets(robot_id):
             part = (ent.id, tuple(links or ()))
             if part in seen:
                 continue
@@ -1323,7 +1361,8 @@ class WorldSim:
             seen.add(part)
             det = {"category": label, "confidence": round(float(0.9 - 0.05 * rng_m / p.max_range), 3),
                    "pose": {"p": noisy_p, "q": noisy_q}, "size": size, "range": rng_m,
-                   "color": "clear" if alpha < 0.5 else color, "camera": sensor["id"]}
+                   "color": "clear" if alpha < 0.5 else color, "camera": sensor["id"],
+                   "objectRef": self._ideal_object_ref(robot_id, part_id)}
             holes = self._screw_holes(ent, links)
             if holes:
                 det["screwHoles"] = holes

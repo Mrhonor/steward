@@ -29,7 +29,9 @@ UNRECORDED = frozenset({
     ("GET", "/ego/localization"),
     ("GET", "/ego/localization/preview"),
     ("GET", "/ego/view/frame"), ("GET", "/ego/plan"), ("GET", "/ego/receipt"), ("GET", "/skill/status"),
-    ("POST", "/skill/wait"), ("POST", "/clock/sleep"), ("GET", "/ego/inputs"),
+    ("POST", "/skill/wait"), ("POST", "/clock/sleep"), ("GET", "/ego/inputs"), ("GET", "/ego/fault"),
+    ("GET", "/ego/fault/state"),
+    ("POST", "/ego/recovery/analyze"), ("POST", "/ego/recovery/clock"),
 })
 
 
@@ -90,6 +92,92 @@ def replay(runtime: EgoRuntime, inputs: list[dict]) -> None:
 
 
 def _routes(runtime: EgoRuntime) -> dict:
+    def recovery(b, action):
+        if not isinstance(b, dict):
+            raise ValueError("recovery requires a JSON object")
+        id_ = b.get("id")
+        if action == "start":
+            job, context = b.get("job"), b.get("context", "")
+            if (job is not None and not isinstance(job, str)) or not isinstance(context, str):
+                raise ValueError("recovery context and job must be text")
+            return runtime.begin_recovery(job, context)
+        if action == "complete":
+            task, claim, child_id = b.get("task"), b.get("claim"), b.get("childId")
+            if (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
+                    or any(not isinstance(value, str) or not 0 < len(value.strip()) <= 4000 for value in (task, claim))):
+                raise ValueError("task recovery review requires the operator task, EH conclusion and child session")
+            return runtime.begin_task_recovery_review(task.strip(), claim.strip(), child_id)
+        if not isinstance(id_, str) or not id_:
+            raise ValueError("recovery requires its attempt ID")
+        if action == "clock":
+            owner, operation, review = b.get("owner"), b.get("operation"), b.get("reviewId")
+            if (not isinstance(owner, str) or not owner or len(owner) > 100
+                    or operation not in ("pause", "renew", "release")
+                    or (review is not None and (not isinstance(review, str) or not review))):
+                raise ValueError("invalid recovery clock lease")
+            return runtime.recovery_clock(id_, review, owner, operation)
+        if action == "answer_context":
+            request, answer, parent_id = b.get("requestId"), b.get("answer"), b.get("parentId")
+            if not isinstance(request, str) or not isinstance(answer, str) or not isinstance(parent_id, str) or not parent_id:
+                raise ValueError("a recovery context answer requires a request ID, EH session and text")
+            return runtime.answer_recovery_context(id_, request, parent_id, answer)
+        if action in ("analyze", "rgbd", "review", "request_context"):
+            review = b.get("reviewId")
+            if review is not None and (not isinstance(review, str) or not review):
+                raise ValueError("invalid recovery review ID")
+            if action == "request_context":
+                child_id, parent_id = b.get("childId"), b.get("parentId")
+                question, reason = b.get("question"), b.get("reason")
+                if (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
+                        or not isinstance(parent_id, str) or not parent_id
+                        or any(not isinstance(text, str) or not 0 < len(text.strip()) <= 2000
+                               for text in (question, reason))):
+                    raise ValueError("a recovery context request requires a child session, question and reason")
+                return runtime.request_recovery_context(id_, review, child_id, parent_id, question.strip(), reason.strip())
+            if action == "rgbd":
+                camera = b.get("camera")
+                if camera is not None and (not isinstance(camera, str) or len(camera) > 100):
+                    raise ValueError("invalid robot camera name")
+                return runtime.capture_recovery_rgbd(id_, review, camera)
+            if action == "analyze":
+                code, ref = b.get("code"), b.get("ref")
+                if not isinstance(code, str) or (ref is not None and not isinstance(ref, str)):
+                    raise ValueError("analysis requires Python source and accepts one sample reference")
+                return runtime.analyze_recovery(id_, code, review, ref)
+            if review is None:
+                raise ValueError("review completion requires a review ID")
+            report = b.get("report")
+            if report is not None:
+                if (not isinstance(report, dict) or set(report) - {"taskCompleted"} != {"verdict", "reason", "evidence"}
+                        or ("taskCompleted" in report and not isinstance(report["taskCompleted"], bool))
+                        or report["verdict"] not in ("resolved", "unresolved", "insufficient_evidence")
+                        or not isinstance(report["reason"], str) or not 0 < len(report["reason"].strip()) <= 4096
+                        or not isinstance(report["evidence"], list) or len(report["evidence"]) > 16
+                        or any(not isinstance(ref, str) or not 0 < len(ref) <= 100 for ref in report["evidence"])):
+                    raise ValueError("invalid recovery review report")
+            return runtime.finish_recovery_review(id_, review, report)
+        if action == "finish":
+            completed = b.get("completed")
+            if not isinstance(completed, bool):
+                raise ValueError("diagnosis completion must be boolean")
+            report, child_id = b.get("report"), b.get("childId")
+            if completed and (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
+                              or not isinstance(report, dict)
+                              or set(report) != {"cause", "evidence", "recommendation", "verification"}
+                              or any(not isinstance(value, str) or not 0 < len(value.strip()) <= 4096
+                                     for value in report.values())):
+                raise ValueError("a completed diagnosis requires a diagnosis report")
+            return runtime.finish_recovery_diagnosis(id_, completed, report, child_id)
+        refs = b.get("referenceBacks", [])
+        if not isinstance(refs, list) or len(refs) > 2 or not all(isinstance(ref, str) for ref in refs):
+            raise ValueError("referenceBacks must contain at most two Ego-State IDs")
+        return runtime.begin_recovery_review(id_, refs)
+
+    def degrade(b):
+        if not isinstance(b, dict) or set(b) != {"reason"}:
+            raise ValueError("a degraded report accepts only a reason")
+        return runtime.report_degraded(b["reason"])
+
     def report(b):
         message = str(b.get("message", "")).strip()
         if not message:
@@ -125,6 +213,19 @@ def _routes(runtime: EgoRuntime) -> dict:
             "frame": (runtime.segmentation_preview.latest(q.get("camera", "head_camera"), q.get("after"))
                       if runtime.perception_mode == "rgbd-segmenter" else None)},
         ("GET", "/ego/summary"): lambda q, b: runtime.summary(),
+        ("GET", "/ego/fault"): lambda q, b: runtime.fault_status(),
+        ("GET", "/ego/fault/state"): lambda q, b: runtime.fault_state(),
+        ("POST", "/ego/fault/degrade"): lambda q, b: degrade(b),
+        ("POST", "/ego/recovery/start"): lambda q, b: recovery(b, "start"),
+        ("POST", "/ego/recovery/clock"): lambda q, b: recovery(b, "clock"),
+        ("POST", "/ego/recovery/task-review"): lambda q, b: recovery(b, "complete"),
+        ("POST", "/ego/recovery/analyze"): lambda q, b: recovery(b, "analyze"),
+        ("POST", "/ego/recovery/context/request"): lambda q, b: recovery(b, "request_context"),
+        ("POST", "/ego/recovery/context/answer"): lambda q, b: recovery(b, "answer_context"),
+        ("POST", "/ego/recovery/rgbd"): lambda q, b: recovery(b, "rgbd"),
+        ("POST", "/ego/recovery/finish"): lambda q, b: recovery(b, "finish"),
+        ("POST", "/ego/recovery/verify"): lambda q, b: recovery(b, "verify"),
+        ("POST", "/ego/recovery/verify/finish"): lambda q, b: recovery(b, "review"),
         ("GET", "/ego/state"): lambda q, b: runtime.ego_state().to_dict(),
         ("GET", "/ego/query"): lambda q, b: {"objects": runtime.query(
             q.get("category"), q.get("near"), float(q["radius"]) if "radius" in q else None)},

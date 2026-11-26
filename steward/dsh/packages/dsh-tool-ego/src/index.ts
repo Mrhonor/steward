@@ -8,12 +8,30 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool, type InferValue, type ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { recordingId } from '@steward/dsh-ego'
+import z from '@deepseek-ai/schemastery'
+import { defineTool, type InferValue, type ToolDefinition, type ToolExecution } from '@deepseek-ai/dsh-tools'
+import { EgoError, recordingId } from '@steward/dsh-ego'
 import type { EgoService, JsonObject, PredictionReceipt, SkillJob } from '@steward/dsh-ego'
+import { recoveryTools } from './recovery.ts'
 
 export const name = 'steward-tool-ego'
-export const inject = ['tools', 'ego']
+export const inject = ['tools', 'ego', 'subagents']
+
+/** Model route and time budget for the read-only recovery diagnostician. */
+export interface Config {
+  recoveryProvider: string
+  recoveryModel: string
+  /** Provider-specific reasoning effort for the recovery session. */
+  recoveryReasoningEffort: string
+  recoveryTimeoutMs: number
+}
+
+export const Config: z<Config> = z.object({
+  recoveryProvider: z.string().default('deepseek-official'),
+  recoveryModel: z.string().default('deepseek-flash'),
+  recoveryReasoningEffort: z.string().min(1).default('max'),
+  recoveryTimeoutMs: z.natural().min(1000).max(600_000).default(360_000),
+})
 
 const JSON_OUTPUT = { type: 'json' } as const
 type Json = InferValue<typeof JSON_OUTPUT>
@@ -49,9 +67,24 @@ function jobView(job: SkillJob): JsonObject {
 /**
  * Build the robot tool definitions over an Ego service.
  * @param ego - the `ctx.ego` service.
+ * @param diagnoseBlockedMotion - starts read-only recovery when the Runtime requires a diagnosis.
  * @returns tool definitions in registration order.
  */
-export function egoTools(ego: EgoService): ToolDefinition[] {
+export function egoTools(ego: EgoService, diagnoseBlockedMotion?: ReturnType<typeof recoveryTools>['diagnoseBlockedMotion']): ToolDefinition[] {
+  async function runMotion(start: () => Promise<SkillJob>, timeout: number | undefined, exec: ToolExecution): Promise<Json> {
+    let job: SkillJob
+    try {
+      job = await start()
+    } catch (error) {
+      if (!(error instanceof EgoError) || error.code !== 'diagnosis_required' || !diagnoseBlockedMotion || !exec.agent) throw error
+      const diagnostic = await diagnoseBlockedMotion(exec.agent, exec.signal)
+      return json({ state: 'blocked', code: error.code, message: 'The command did not execute. '
+        + (diagnostic.needsContext === true
+          ? 'Answer the recovery subagent with ego_answer_recovery_context before requesting motion.'
+          : 'Read the recovery result before deciding on a new command.'), diagnostic })
+    }
+    return json(jobView(timeout === undefined ? job : await ego.wait(job.id, timeout, exec.signal)))
+  }
   return [
     defineTool({
       name: 'ego_state',
@@ -62,10 +95,10 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
         + 'axes may be ambiguous. screwHoles includes source and frame. Outline-compatible priors retain source=prior; '
         + 'positionsByRegistration lists alternative entity-frame positions (one shared index for all holes on an object). '
         + 'orientation.holeRegistration explains compatibility and unresolved half turns. Unregistered templates cannot '
-        + 'drive alignment: reobserve dimensions/features or use ordinary placement. A label alone is not registration. '        + 'appearance says what you remember of an object\'s top face: how long ago you '
-        + 'saw it, the share seen, plain / interiorColors (plain true or interiorColors under about 20: a cardboard '
-        + 'back; do not use spread alone — lighting makes a plain back look varied) and stale (put down since, look '
-        + 'again); ego_match_face compares remembered faces.',
+        + 'drive alignment: reobserve dimensions/features or use ordinary placement. A label alone is not registration. '
+        + 'appearance includes the age and coverage of the remembered top face and whether it went stale after placement. '
+        + 'plain and interiorColors describe colour variation; a plain face can be printed. Use ego_inspect for fresh evidence. '
+        + 'fault reports the diagnostic state and the first reason for degradation.',
       parameters: {},
       output: { schema: JSON_OUTPUT, render: (_a, v) => text(v) },
       async execute(_args, exec) {
@@ -170,8 +203,7 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
       },
       output: { schema: JSON_OUTPUT, render: (_a, v) => text(v) },
       async execute(args, exec) {
-        const job = await ego.explore(exec.signal)
-        return json(jobView(await ego.wait(job.id, args.timeoutS ?? 120, exec.signal)))
+        return runMotion(() => ego.explore(exec.signal), args.timeoutS ?? 120, exec)
       },
     }),
     defineTool({
@@ -319,10 +351,11 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
         + 'surface only from some way ahead of it; wide_camera, a short-focal-length camera tilted further down, also sees '
         + 'the strip of a table next to the edge you stand at and the gripper at work, in less detail. When part of the face is unseen, hint says '
         + 'why (too close below the view, beside or behind it, too far, hidden) and how to move. Use it to compare '
-        + 'printed or patterned faces, read which side of a flat object is up, or tell similar objects apart. A '
-        + 'printed flat object lying with its plain back up: use plain === true or interiorColors (under about 20). '
-        + 'Do not use spread / interiorSpread alone — table lighting makes cardboard look variegated in RGB even when '
-        + 'it is one colour. Turn it over (place with flip) and look again. Flat objects lying on or against each other hide '
+        + 'printed or patterned faces, check which side of a flat object is up, or tell similar objects apart. '
+        + 'plain and interiorColors describe colour variation; a solid print can also be plain. Compare a clear '
+        + 'reference match or compare colour and texture with a confirmed back seen under similar lighting. '
+        + 'If unclear, change the view or flip once and inspect the same object again. Keep the side uncertain '
+        + 'if the two observations remain ambiguous. Flat objects lying on or against each other hide '
         + 'parts of their faces and can be perceived as one object, and one lying on another can hide it wholly: set '
         + 'them apart on free space first, looking again where each one lay after picking it up. The object frame stays '
         + 'fixed to the object between views and while it is carried, so one inspection before picking it tells which '
@@ -351,7 +384,8 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
         + 'place yaw = H + turnDeg. score is a correlation (1 = identical); a best score barely above the second is '
         + 'ambiguous, so look closer (raise px toward 32) and match again. offsetM is good to about one cell (cellM): '
         + 'when you know the layout (for example a grid of equal pieces), snap it to the nearest slot. '
-        + 'plain / interiorColors (under about 20) means a cardboard back facing up; do not trust spread alone. '
+        + 'A clear reference match supports the printed side facing up. A weak or ambiguous match leaves the side uncertain, '
+        + 'especially on a low-texture face. plain and interiorColors describe colour variation. '
         + 'An entry with error says what to look at.',
       parameters: {
         entities: { type: 'array', items: { type: 'string' }, required: true, description: 'Ids of the objects whose faces are sought.' },
@@ -416,12 +450,16 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
     defineTool({
       name: 'skill_run',
       description: 'Execute the plan of a receipt from ego_predict. Waits for the skill to finish unless wait is '
-        + 'false. Staged assembly skills can take tens of minutes: a wait timeout leaves the job running. '
+        + 'false. After the first pick miss with an empty gripper, reobserve from a fresh viewpoint and use the new evidence to plan another pick. '
+        + 'If a second pick of the same target misses after reobservation, or other sensor evidence shows a fault, call '
+        + 'ego_report_degraded and ego_begin_recovery. Provide the failed Job IDs, target and observations. '
+        + 'Staged assembly skills can take tens of minutes: a wait timeout leaves the job running. '
         + 'Poll its status; keep each run_code wait at most 240 seconds and do not body_stop just because a poll times out. '
         + 'While such a skill runs the robot may leave the table, change viewpoints and fetch parts on its own; a status that stays running or docked for many minutes is normal. '
         + 'Interrupting a running assembly skill usually leaves the part placed but not fastened. When it ends, confirm with ego_state that the part is on its body before the next step. '
         + 'If one sub-goal shows no real progress after three high-level attempts, switch to another sub-goal and return to it later. '
-        + 'The robot refuses receipts that are infeasible, expired, already used, or above the risk limit.',
+        + 'The robot refuses receipts that are infeasible, expired, already used, or above the risk limit. '
+        + 'If it blocks a repeat in DEGRADED, it opens read-only recovery and returns state=blocked and the diagnosis or context request. The command did not run.',
       parameters: {
         receipt: { type: 'string', required: true, description: 'Receipt id returned by ego_predict.' },
         wait: { type: 'boolean', description: 'Wait for completion (default true).' },
@@ -429,9 +467,7 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
       },
       output: { schema: JSON_OUTPUT, render: (_a, v) => text(v) },
       async execute(args, exec) {
-        const job = await ego.run(args.receipt, exec.signal)
-        if (args.wait === false) return json(jobView(job))
-        return json(jobView(await ego.wait(job.id, args.timeoutS ?? 180, exec.signal)))
+        return runMotion(() => ego.run(args.receipt, exec.signal), args.wait === false ? undefined : args.timeoutS ?? 180, exec)
       },
     }),
     defineTool({
@@ -450,6 +486,19 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
       output: { schema: JSON_OUTPUT, render: (_a, v) => text(v) },
       async execute(_args, exec) {
         return json(await ego.stop(exec.signal))
+      },
+    }),
+    defineTool({
+      name: 'ego_report_degraded',
+      description: 'Record an observed difficulty such as repeated actions without progress or conflicting sensor feedback. '
+        + 'After an isolated pick miss with an empty gripper, start by reobserving the target. '
+        + 'This marks the episode DEGRADED. A repeated command can then require diagnosis before more motion.',
+      parameters: {
+        reason: { type: 'string', required: true, description: 'Describe the difficulty and the observations that support it.' },
+      },
+      output: { schema: JSON_OUTPUT, render: (_a, v) => text(v) },
+      async execute(args, exec) {
+        return json(await ego.reportDegraded(args.reason, exec.signal))
       },
     }),
     defineTool({
@@ -474,6 +523,9 @@ export function egoTools(ego: EgoService): ToolDefinition[] {
   ]
 }
 
-export function apply(ctx: Context): void {
-  for (const tool of egoTools(ctx.ego)) ctx.tools.register(tool)
+export function apply(ctx: Context, config: Config): void {
+  const { tools, diagnoseBlockedMotion } = recoveryTools(ctx, config)
+  for (const tool of [...egoTools(ctx.ego, diagnoseBlockedMotion), ...tools]) {
+    ctx.effect(() => ctx.tools.register(tool))
+  }
 }

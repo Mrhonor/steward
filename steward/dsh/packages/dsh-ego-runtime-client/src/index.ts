@@ -47,7 +47,7 @@ export class EgoRuntimeClient extends EgoService {
     try {
       return await requestJson<T>(this.base, method, path, body, { signal, timeoutMs })
     } catch (error) {
-      if (error instanceof HttpJsonError) throw new EgoError(error.message, error.status)
+      if (error instanceof HttpJsonError) throw new EgoError(error.message, error.status, error.code)
       throw error
     }
   }
@@ -168,6 +168,58 @@ export class EgoRuntimeClient extends EgoService {
 
   reportProblem(report: ProblemReport, signal?: AbortSignal): Promise<JsonObject> {
     return this.call('POST', '/ego/alert', { ...report, source: 'agent', level: 'blocked' }, signal)
+  }
+
+  reportDegraded(reason: string, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/fault/degrade', { reason }, signal)
+  }
+
+  faultState(signal?: AbortSignal): ReturnType<EgoService['faultState']> {
+    return this.call('GET', '/ego/fault/state', undefined, signal)
+  }
+
+  beginRecovery(context: string, job?: string, signal?: AbortSignal): Promise<{ id: string; diagnostic: JsonObject }> {
+    return this.call('POST', '/ego/recovery/start', { context, job }, signal)
+  }
+
+  recoveryClock(id: string, lease: { reviewId?: string; owner: string; operation: 'pause' | 'renew' | 'release' },
+    signal?: AbortSignal): Promise<{ supported: boolean }> {
+    return this.call('POST', '/ego/recovery/clock', { id, ...lease }, signal, 4000)
+  }
+
+  analyzeRecovery(id: string, code: string, scope: { reviewId?: string; ref?: string }, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/analyze', { id, code, ...scope }, signal)
+  }
+
+  captureRecoveryRgbd(id: string, scope: { reviewId?: string; camera?: string }, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/rgbd', { id, ...scope }, signal)
+  }
+
+  requestRecoveryContext(id: string, request: { childId: string; parentId: string; reviewId?: string; question: string; reason: string },
+    signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/context/request', { id, ...request }, signal)
+  }
+
+  answerRecoveryContext(id: string, answer: { requestId: string; parentId: string; answer: string }, signal?: AbortSignal):
+    Promise<{ childId: string; reviewId: string | null; completionReview: boolean; evidence: JsonObject }> {
+    return this.call('POST', '/ego/recovery/context/answer', { id, ...answer }, signal)
+  }
+
+  finishRecovery(id: string, completed: boolean, diagnosis?: { report: JsonObject; childId: string }, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/finish', { id, completed, ...diagnosis }, signal)
+  }
+
+  beginRecoveryReview(id: string, referenceBacks: string[], signal?: AbortSignal):
+    Promise<{ reviewId: string; childId: string; evidence: JsonObject } | { verified: false; reason: string }> {
+    return this.call('POST', '/ego/recovery/verify', { id, referenceBacks }, signal)
+  }
+
+  beginTaskRecoveryReview(task: string, claim: string, childId: string, signal?: AbortSignal): ReturnType<EgoService['beginTaskRecoveryReview']> {
+    return this.call('POST', '/ego/recovery/task-review', { task, claim, childId }, signal)
+  }
+
+  finishRecoveryReview(id: string, reviewId: string, report?: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/verify/finish', { id, reviewId, report }, signal)
   }
 }
 

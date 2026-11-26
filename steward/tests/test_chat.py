@@ -142,6 +142,10 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
     assert "flip_flat_objects_face_up（skill，verified）" in stdin
     assert stdin.endswith("\n\n操作员任务：把杯子放到餐桌上"), "the capability list precedes the instruction marker"
     assert "interiorSpread" in ROBOT_BRIEF and "相关系数" in ROBOT_BRIEF
+    assert "纯色印花也会如此" in stdin and "本轮已确认的背面" in stdin
+    assert "翻一次并复查同一物体" in stdin and "仍分不清就标记为不确定" in stdin
+    assert "第一次 pick 抓空且夹爪为空时，先换视角补充观测，核对目标和抓取位置，再重新预测" in stdin
+    assert "对同一目标复查后再次抓空，或有其他传感器证据显示故障时，主动调用 ego_report_degraded" in stdin
     assert "双手" in robot_brief("cobot-magic") and "arm: \"L\"" in robot_brief("cobot-magic")
     assert "单手" in robot_brief("steward-bot") and robot_brief(None) == ROBOT_BRIEF
     assert capabilities_digest(None) == "" and capabilities_digest(tmp_path / "empty") == ""

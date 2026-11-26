@@ -123,7 +123,7 @@ function harness(config = {}) {
     tools: { register: (tool) => { registered.push(tool); return () => {} } },
   }
   apply(ctx, Config({ instructionMarker: '操作员任务：', effort: EFFORT, checkpointEvery: 0, idleEvery: 0, ...config }))
-  const agent = {}
+  const agent = { session: { header: {} } }
   const signal = new AbortController().signal
   const claim = (text, kind = 'user') => handlers['agent/inbox/claimed']({ agent, message: { source: { kind }, content: [{ type: 'text', text }] }, turn: 1 })
   const run = (name, args, result, extra = {}) => handlers['tools/post-execute'](

@@ -259,7 +259,7 @@ export interface SkillJob {
 
 /** Failure reported by an Ego provider, carrying the runtime status when one exists. */
 export class EgoError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(message: string, readonly status?: number, readonly code?: string) {
     super(message)
     this.name = 'EgoError'
   }
@@ -424,6 +424,124 @@ export abstract class EgoService extends Service {
    * @returns the recorded alert.
    */
   abstract reportProblem(report: ProblemReport, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Mark this episode as degraded for diagnostics.
+   * @param reason - the observed difficulty and its evidence.
+   * @param signal - caller cancellation.
+   * @returns the diagnostic state and its first degradation reason.
+   */
+  abstract reportDegraded(reason: string, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Read the current fault state before diagnosis or task review.
+   * @param signal - caller cancellation.
+   * @returns the current episode fault state without its history.
+   */
+  abstract faultState(signal?: AbortSignal): Promise<{ state: 'NORMAL' | 'DEGRADED' | 'RECOVERY';
+    diagnosisRequired?: { job: string; operation: string; target: string | null };
+    recovery?: { id: string; contextRequest?: { id: string; question: string; reason: string } } }>
+
+  /**
+   * Start a diagnostic attempt and capture detached robot evidence.
+   * @param context - task context to provide to the diagnostician.
+   * @param job - optional recorded fault job for an Agent-reported difficulty.
+   * @param signal - caller cancellation.
+   * @returns the attempt ID and the diagnostic input.
+   */
+  abstract beginRecovery(context: string, job?: string, signal?: AbortSignal): Promise<{ id: string; diagnostic: JsonObject }>
+
+  /**
+   * Acquire, renew, or release a simulation clock pause without blocking current sensor reads.
+   * @param id - the recovery attempt.
+   * @param lease - the review ID, lease owner, and requested operation.
+   * @param signal - caller cancellation.
+   * @returns whether the robot port supports pausing its clock.
+   */
+  abstract recoveryClock(id: string, lease: { reviewId?: string; owner: string; operation: 'pause' | 'renew' | 'release' },
+    signal?: AbortSignal): Promise<{ supported: boolean }>
+
+  /**
+   * Evaluate bounded Python on the attempt's captured sensor data.
+   * @param id - the recovery attempt.
+   * @param code - Python assignments and an output expression.
+   * @param scope - the read-only review ID and sample reference, when supplied.
+   * @param signal - caller cancellation.
+   * @returns the expression value.
+   */
+  abstract analyzeRecovery(id: string, code: string, scope: { reviewId?: string; ref?: string }, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Sample a camera on the robot and register the frame in the current diagnosis or review.
+   * @param id - the recovery attempt.
+   * @param scope - the review ID and robot camera name, when supplied.
+   * @param signal - caller cancellation.
+   * @returns the evidence reference, metadata and pixel preview.
+   */
+  abstract captureRecoveryRgbd(id: string, scope: { reviewId?: string; camera?: string }, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Record the child session's question and wait for EH to answer it.
+   * @param id - the recovery attempt.
+   * @param request - the scoped child, EH Session and question.
+   * @param signal - caller cancellation.
+   * @returns the pending request and recovery state.
+   */
+  abstract requestRecoveryContext(id: string, request: { childId: string; parentId: string; reviewId?: string; question: string; reason: string },
+    signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Consume a pending question and return the evidence for continuing the same Session.
+   * @param id - the recovery attempt.
+   * @param answer - the pending question ID, EH Session and relevant context.
+   * @param signal - caller cancellation.
+   * @returns the existing child Session and evidence for its next turn.
+   */
+  abstract answerRecoveryContext(id: string, answer: { requestId: string; parentId: string; answer: string }, signal?: AbortSignal):
+    Promise<{ childId: string; reviewId: string | null; completionReview: boolean; evidence: JsonObject }>
+
+  /**
+   * Move the attempt to verification or abandon it.
+   * @param id - the current attempt.
+   * @param completed - whether diagnosis completed successfully.
+   * @param diagnosis - the structured diagnosis and child Session ID on completion.
+   * @param signal - caller cancellation.
+   * @returns the diagnostic state.
+   */
+  abstract finishRecovery(id: string, completed: boolean, diagnosis?: { report: JsonObject; childId: string }, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Open a read-only review with fresh evidence, or return the reason it cannot start.
+   * @param id - the current attempt.
+   * @param referenceBacks - optional Ego-State IDs for two cardboard reference faces.
+   * @param signal - caller cancellation.
+   * @returns the review ID and evidence, or a pending status.
+   */
+  abstract beginRecoveryReview(id: string, referenceBacks: string[], signal?: AbortSignal):
+    Promise<{ reviewId: string; childId: string; evidence: JsonObject } | { verified: false; reason: string }>
+
+  /**
+   * Open or resume a read-only review when an EH task is about to end.
+   * @param task - the operator's current task.
+   * @param claim - the EH's closing summary, treated as an unverified claim.
+   * @param childId - the reserved Session ID to use if no previous recovery child exists.
+   * @param signal - caller cancellation.
+   * @returns the review and child IDs, a pending question, or the reason a review did not open.
+   */
+  abstract beginTaskRecoveryReview(task: string, claim: string, childId: string, signal?: AbortSignal): Promise<
+    { id: string; reviewId: string; childId: string; newChild: boolean; evidence: JsonObject }
+    | { state: string; reason?: string; needsContext?: boolean; request?: { id: string; question: string; reason: string };
+      recovery?: { id: string } }>
+
+  /**
+   * Check the review and commit recovery, or close a cancelled review for a retry.
+   * @param id - the recovery attempt.
+   * @param reviewId - the active review ID.
+   * @param report - the review verdict and cited evidence, or undefined on cancellation.
+   * @param signal - caller cancellation.
+   * @returns the diagnostic state and verification outcome.
+   */
+  abstract finishRecoveryReview(id: string, reviewId: string, report?: JsonObject, signal?: AbortSignal): Promise<JsonObject>
 
   /**
    * Save synchronized images from the robot's existing cameras.

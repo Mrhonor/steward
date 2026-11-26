@@ -58,7 +58,7 @@ def test_failed_approach_does_not_start_arm_recovery_or_homing(monkeypatch, fail
     executor._home_empty = lambda tick: pytest.fail("unsuccessful approach must not home the arms")
     if failure == "missed_dock":
         monkeypatch.setattr(executor, "_translate_to", lambda *args, **kwargs: None)
-        monkeypatch.setattr(executor, "_backoff", lambda plan: None)
+        monkeypatch.setattr(executor, "_backoff", lambda job, plan: None)
     else:
         def drive(job, path, yaw):
             raise {"drive": SkillFailed, "unexpected": RuntimeError, "stopped": SkillStopped}[failure]("drive stopped")

@@ -39,9 +39,10 @@ class CancellableHandler:
 
 
 class HttpError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, *, code: str | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class Binary:
@@ -116,7 +117,7 @@ class JsonServer:
                 except CancelledError:
                     return  # The cooperative handler has settled; its disconnected peer needs no reply.
                 except HttpError as exc:
-                    self._send(exc.status, {"error": str(exc)})
+                    self._send(exc.status, {"error": str(exc), **({"code": exc.code} if exc.code is not None else {})})
                     return
                 except Exception as exc:  # noqa: BLE001 - reported to the caller as a 500 body
                     self._send(500, {"error": f"{type(exc).__name__}: {exc}"})

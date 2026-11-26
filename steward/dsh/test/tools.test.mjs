@@ -31,6 +31,7 @@ function fakeEgo(receipts = {}) {
     wait: async (id, timeoutS) => { calls.push(['wait', id, timeoutS]); return job('succeeded') },
     stop: async () => ({ stopped: null }),
     reportProblem: async (report) => { calls.push(['report', report]); return { id: 1, ...report } },
+    reportDegraded: async (reason) => { calls.push(['degraded', reason]); return { state: 'DEGRADED' } },
     inspect: async (entity, px) => { calls.push(['inspect', entity, px]); return { entity, px, rows: [], coverage: 0 } },
     screwHoles: async (entity) => { calls.push(['screwHoles', entity]); return { entity, holesFaceUp: true, holes: [] } },
     matchFace: async (entities, reference, px) => { calls.push(['matchFace', entities, reference, px]); return { reference, results: [] } },
@@ -52,8 +53,15 @@ test('ego tools expose the robot vocabulary without World State concepts', () =>
   const names = egoTools(fakeEgo()).map(t => t.name)
   assert.deepEqual(names, ['ego_state', 'ego_query', 'ego_observe', 'ego_capture_cameras', 'ego_rgb_recording_start',
     'ego_rgb_recording_status', 'ego_rgb_recording_stop', 'ego_camera_calibration', 'ego_gripper_pose', 'ego_explore', 'ego_predict', 'ego_screw_holes', 'ego_inspect',
-    'ego_match_face', 'ego_annotate', 'ego_forget', 'ego_candidates', 'skill_run', 'skill_status', 'body_stop', 'report_problem'])
+    'ego_match_face', 'ego_annotate', 'ego_forget', 'ego_candidates', 'skill_run', 'skill_status', 'body_stop', 'ego_report_degraded', 'report_problem'])
   for (const t of egoTools(fakeEgo())) assert.doesNotMatch(t.description, /ground truth|world state/i)
+})
+
+test('ego_report_degraded sends a reason and returns the diagnostic state', async () => {
+  const ego = fakeEgo()
+  const result = await tool(egoTools(ego), 'ego_report_degraded').execute({ reason: 'Repeated flips' }, exec('ego_report_degraded'))
+  assert.deepEqual(ego.calls, [['degraded', 'Repeated flips']])
+  assert.deepEqual(result, { state: 'DEGRADED' })
 })
 
 test('ego_predict forwards only the given parameters and hides the raw path', async () => {
@@ -131,6 +139,9 @@ test('ego_predict passes a placing heading, a flip and a clearance; pour is a sk
 test('ego_inspect and ego_annotate reach the Ego service', async () => {
   const ego = fakeEgo()
   const tools = egoTools(ego)
+  assert.match(tool(tools, 'ego_state').description, /a plain face can be printed/)
+  assert.match(tool(tools, 'ego_inspect').description, /flip once and inspect the same object again/)
+  assert.match(tool(tools, 'ego_match_face').description, /A weak or ambiguous match leaves the side uncertain/)
   await tool(tools, 'ego_inspect').execute({ entity: 'e:7' }, exec('ego_inspect'))
   await tool(tools, 'ego_match_face').execute({ entities: ['e:7', 'e:8'], reference: 'e:1' }, exec('ego_match_face'))
   await tool(tools, 'ego_annotate').execute({ entity: 'e:7', label: 'box', affordances: ['graspable', 'pourable'] }, exec('ego_annotate'))
