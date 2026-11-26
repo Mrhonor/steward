@@ -227,21 +227,21 @@ def test_pick_retry_after_empty_contact(workbench, record_property, failure):
     target = _track(runtime, "mug", "black")
     attempts = []
     for attempt in range(3):
-        link.missed_closes = {"one_close": 1, "one_job": None if attempt == 0 else 0,
+        link.missed_closes = {"one_close": 1 if attempt == 0 else 0, "one_job": None if attempt == 0 else 0,
                               "persistent": None}[failure]
         attempts.append(_attempt(workbench, "pick", {"target": target}))
         if attempts[-1]["actualHeld"] == TARGET:
             break
     _record(record_property, attempts)
     assert [row["state"] for row in attempts] == {
-        "one_close": ["succeeded"], "one_job": ["failed", "succeeded"], "persistent": ["failed"] * 3,
+        "one_close": ["failed", "succeeded"], "one_job": ["failed", "succeeded"], "persistent": ["failed"] * 3,
     }[failure]
     for row in attempts:
         assert row["closes"] >= 1
         assert row["actualHeld"] == (TARGET if row["state"] == "succeeded" else None)
         assert row["egoHeld"] == (target if row["state"] == "succeeded" else None)
     if failure == "one_close":
-        assert attempts[0]["closes"] == 2
+        assert [row["closes"] for row in attempts] == [1, 1]
     fault = runtime.fault_status()
     assert [row["job"] for row in fault["actions"]] == [row["job"] for row in attempts]
     assert fault["actions"][-1]["after"]["gripper"]["holding"] == attempts[-1]["sensorHolding"]

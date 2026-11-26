@@ -7,7 +7,18 @@ telemetry). It never holds World State identifiers or ground truth.
 
 from __future__ import annotations
 
+from steward.assembly_profile import enabled as _assembly_enabled
+
+
+if _assembly_enabled():
+    from steward.ego import capabilities
+    from steward.ego import decision_observation as decision_views
+
+    from steward.ego.phase_timing import timed
+
 import base64
+if _assembly_enabled():
+    from copy import deepcopy
 import collections
 import copy
 import io
@@ -23,7 +34,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from concurrent.futures import CancelledError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+if _assembly_enabled():
+    from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,6 +49,7 @@ from steward.ego.perception import (PerceptionConfig, box_of, decimated, decode_
                                     world_up_face)
 from steward.ego.kinematics import BASE_AXES, CAMERA_AXES, base_to_odometry, camera_to_base, gripper_pose, gripper_to_base
 from steward.ego.arm import Arm
+from steward.ego.cobot_arm import PiperArm
 from steward.ego.esim import Esim, EsimConfig, PredictionError
 from steward.ego.estimator import SELF_ID, EgoEstimator, _CONTENT
 from steward.ego.fault_monitor import FaultMonitor, FaultMonitorConfig, motion_feedback
@@ -44,6 +58,8 @@ from steward.ego.localization_feedback import LocalizationFeedback
 from steward.ego import reflection
 from steward.ego.reflection import ReflectionConfig
 from steward.ego.roles import RoleConfig, assign_roles
+if _assembly_enabled():
+    from steward.ego.public import public_json
 from steward.ego.segmenter import DepthClusters, Segmenter, SegmenterError
 from steward.ego.segmentation_preview import SegmentationPreview
 from steward.ego.skills import GraspIdentityFailed, Job, MotionConfig, SkillExecutor, SkillFailed
@@ -72,7 +88,10 @@ class FaceMatchSnapshot:
 
 @dataclass
 class RuntimeConfig:
-    perception_hz: float = 10.0
+    if _assembly_enabled():
+        perception_hz: float = float(capabilities.get('STEWARD_PERCEPTION_HZ'))
+    else:
+        perception_hz: float = 10.0
     telemetry_hz: float = 2.0
     appearance_cell_m: float = 0.002  # cell size of the remembered top faces (~2 mm; a 5.75 cm piece is ~29 cells)
     appearance_max_m: float = 0.6  # larger objects' faces are remembered only when asked for
@@ -141,6 +160,8 @@ class RuntimeConfig:
     roles: RoleConfig = field(default_factory=RoleConfig)
     reflection: ReflectionConfig = field(default_factory=ReflectionConfig)
     fault_monitor: FaultMonitorConfig = field(default_factory=FaultMonitorConfig)
+    if _assembly_enabled():
+        decision_observation: bool = field(default_factory=lambda: capabilities.get('STEWARD_DECISION_OBSERVATION') != '0')
     localization_config: str | None = None
     """Opt-in segmented-depth localization TOML; diagnostic unless localization_apply is enabled."""
     localization_apply: bool = False
@@ -181,6 +202,63 @@ def _fresh_look_prompts(category: str, color: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))[:3]  # three prompts at most: each one is a segmenter round trip
 
 
+def _anonymous_reading(frame: dict, cam: dict, believed: np.ndarray, cfg) -> np.ndarray | None:
+    """The world-frame centre of the anonymous instance that stands where ``believed`` says, or None.
+
+    Without a robot-side segmenter the world's frames carry class-agnostic instance masks whose ids
+    are shuffled every frame and carry no identity, so the instance meant is chosen geometrically,
+    exactly like a segmented look: of the instances whose depth reads, the nearest to the belief
+    that also agrees in height (``relocate_max_dz_m``) and stays within ``relocate_max_jump_m``.
+    The reading is the depth's own median, not the plan's spot."""
+    mask, depth = frame.get("mask"), frame["depth"]
+    if mask is None:
+        return None
+    h, w = depth.shape
+    f = (h / 2.0) / math.tan(math.radians(frame["fovy"]) / 2.0)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    rot = matrix_from_quat(cam["q"])
+    origin = np.asarray(cam["p"], float)
+    ys, xs = np.nonzero(mask)
+    labels = mask[ys, xs]
+    best, best_d = None, cfg.relocate_max_jump_m
+    for label in np.unique(labels):
+        sel = labels == label
+        dd = depth[ys[sel], xs[sel]].astype(np.float32)
+        ok = (dd > 0.05) & (dd < 6.0)
+        if int(ok.sum()) < cfg.relocate_min_points:
+            continue
+        pts = np.stack([dd[ok], -(xs[sel][ok] - cx) * dd[ok] / f, -(ys[sel][ok] - cy) * dd[ok] / f], axis=1)
+        centre = np.median(pts @ rot.T + origin, axis=0)
+        if abs(float(centre[2]) - float(believed[2])) > cfg.relocate_max_dz_m:
+            continue  # an instance at another height is another thing (a table edge, the floor)
+        dist = float(np.linalg.norm(centre - believed[:3]))
+        if dist < best_d:
+            best, best_d = centre, dist
+    return best
+
+
+def _detection_reading(frame: dict, cams: dict, believed: np.ndarray, cfg) -> np.ndarray | None:
+    """The world-frame centre of the detection standing where ``believed`` says, or None.
+
+    Ideal-mode frames carry the detector's own noisy boxes instead of masks, so the fresh look
+    reads them too: of the detections, the nearest to the belief that agrees in height
+    (``relocate_max_dz_m``) and stays within ``relocate_max_jump_m`` — the same gates as a masked
+    look, applied to the same noisy sensor channel the fusion consumes, placed exactly as
+    :meth:`EgoEstimator.update` places them. ``cams`` maps the frame's camera ids to their poses."""
+    best, best_d = None, cfg.relocate_max_jump_m
+    for det in frame.get("detections", []):
+        cam = cams.get(det.get("camera", next(iter(cams), None)))
+        if cam is None:
+            continue
+        centre = np.asarray(pose_compose(cam, det["pose"])["p"], float)
+        if abs(float(centre[2]) - float(believed[2])) > cfg.relocate_max_dz_m:
+            continue  # a detection at another height is another thing (a table edge, the floor)
+        dist = float(np.linalg.norm(centre - believed[:3]))
+        if dist < best_d:
+            best, best_d = centre, dist
+    return best
+
+
 class RobotLink:
     """HTTP client of one robot port: the only path between the Ego System and the world."""
 
@@ -188,20 +266,60 @@ class RobotLink:
         self.url = url.rstrip("/")
         self.closed = False  # set on shutdown: clock waits stop retrying
 
+    if _assembly_enabled():
+        def _motion_call(self, method, path, body=None, timeout=10.):
+            from steward.ego.look_timeout import remaining, active
+            left = remaining(timeout)
+            from steward.ego.fasten_sequence import active as drive_active
+            if path == '/clock/wait' and (active() or drive_active()):
+                body = dict(body, timeoutS=min(body.get('timeoutS', left), left))
+            try:
+                result = call(method, self.url+path, body, timeout=left)
+            except Exception:
+                remaining(math.inf)  # convert an exhausted transport budget to partial completion
+                raise
+            remaining(math.inf)
+            return result
+
+    def identity(self) -> dict:
+        """The registered embodiment on this robot port, without scene or object state."""
+        return call("GET", f"{self.url}/identity")
+
+    def require_body(self, body: str) -> None:
+        """Reject a controller whose model does not match the connected robot."""
+        actual = self.identity()["embodiment"]
+        if actual != body:
+            raise ValueError(f"Controller for {body!r} cannot drive {actual!r}; use steward ego --body {actual}")
+
     def sensors(self) -> dict:
-        return call("GET", f"{self.url}/sensors")
+        if _assembly_enabled():
+            return self._motion_call("GET", "/sensors")
+        else:
+            return call("GET", f"{self.url}/sensors")
 
     def proprioception(self) -> dict:
         """Joint encoders and gripper states only, without drawing a perception sample."""
-        return call("GET", f"{self.url}/sensors/proprioception")
+        if _assembly_enabled():
+            return self._motion_call("GET", "/sensors/proprioception")
+        else:
+            return call("GET", f"{self.url}/sensors/proprioception")
 
-    def rgbd(self, camera: str | None = None) -> bytes:
-        """One RGB-D frame (``npz``) of ``camera`` (None: the primary one) when the world provides
-        raw imaging instead of detections."""
-        return call("GET", f"{self.url}/sensors/rgbd" + ("" if camera is None else f"?camera={camera}"))
+    if _assembly_enabled():
+        def rgbd(self, camera: str | None = None, *, timeout: float = 10.) -> bytes:
+            """One RGB-D frame (``npz``) of ``camera`` (None: the primary one) when the world provides
+            raw imaging instead of detections."""
+            return call("GET", f"{self.url}/sensors/rgbd" + ("" if camera is None else f"?camera={camera}"), timeout=timeout)
+    else:
+        def rgbd(self, camera: str | None = None) -> bytes:
+            """One RGB-D frame (``npz``) of ``camera`` (None: the primary one) when the world provides
+            raw imaging instead of detections."""
+            return call("GET", f"{self.url}/sensors/rgbd" + ("" if camera is None else f"?camera={camera}"))
 
     def command(self, cmd: dict) -> None:
-        call("POST", f"{self.url}/command", cmd)
+        if _assembly_enabled():
+            self._motion_call("POST", "/command", cmd)
+        else:
+            call("POST", f"{self.url}/command", cmd)
 
     def telemetry(self, scene: dict) -> None:
         call("POST", f"{self.url}/telemetry", scene)
@@ -241,34 +359,50 @@ class RobotLink:
     def wait_until(self, t: float | None = None, hold: str | None = None, rank: int = 0, pulls: bool = True) -> float:
         """Wait until the world clock reaches ``t`` (``None``: now) and, with ``hold``, the world lets
         this control loop or input run (:meth:`WorldSim.wait_until`); return the world time then.
-        Passive waits may span an idle or paused clock and retry until the link closes."""
+        Passive waits can remain idle indefinitely; pulling waits time out after 60 seconds."""
         body = {"hold": hold, "rank": rank, "pulls": pulls, **({} if t is None else {"until": t})}
         deadline = time.monotonic() + 60.0
+        last = ""
         while True:
             try:
+                if _assembly_enabled():
+                    return self._motion_call("POST", "/clock/wait", body, timeout=6)["t"]
                 return call("POST", f"{self.url}/clock/wait", body, timeout=6)["t"]
             except HttpError as exc:
                 if exc.status != 504 or self.closed:
                     raise
+                last = str(exc)
                 if pulls and time.monotonic() >= deadline:
-                    raise SkillFailed("robot clock wait timed out after 60 s") from exc
+                    raise SkillFailed("robot clock wait timed out after 60 s" +
+                                      (f" ({last})" if "paused" in last else "")) from exc
 
     def arm(self, hold: str, t: float | None = None, rank: int = 0, pulls: bool = True) -> None:
         """Register ``hold`` at world time ``t`` (``None``: now) without waiting, so the world stops for
         it before its owner first waits."""
-        try:
-            call("POST", f"{self.url}/clock/wait", {"hold": hold, "rank": rank, "pulls": pulls, "timeoutS": 0.0,
-                                                     **({} if t is None else {"until": t})})
-        except HttpError as exc:
-            if exc.status != 504:
-                raise
+        if _assembly_enabled():
+            try:
+                self._motion_call("POST", "/clock/wait", {"hold": hold, "rank": rank, "pulls": pulls, "timeoutS": 0.0,
+                                                         **({} if t is None else {"until": t})})
+            except HttpError as exc:
+                if exc.status != 504:
+                    raise
+        else:
+            try:
+                call("POST", f"{self.url}/clock/wait", {"hold": hold, "rank": rank, "pulls": pulls, "timeoutS": 0.0,
+                                                         **({} if t is None else {"until": t})})
+            except HttpError as exc:
+                if exc.status != 504:
+                    raise
 
     def sleep(self, seconds: float) -> float:
         """Let ``seconds`` of world time pass and return the world time then."""
         return self.wait_until(self.wait_until() + seconds)
 
     def release(self, hold: str) -> None:
-        call("POST", f"{self.url}/clock/release", {"hold": hold})
+        if _assembly_enabled():
+            self._motion_call("POST", "/clock/release", {"hold": hold})
+        else:
+            call("POST", f"{self.url}/clock/release", {"hold": hold})
 
     def renew(self, hold: str) -> None:
         call("POST", f"{self.url}/clock/renew", {"hold": hold})
@@ -335,12 +469,29 @@ def in_view(cam: dict, intrinsics: dict, point: np.ndarray, margin: float) -> bo
 
 
 class EgoRuntime:
+    if _assembly_enabled():
+        @cached_property
+        def observation_audit(self):
+            return decision_views.Audit()
+
+        @cached_property
+        def _observation_io(self):
+            return threading.RLock()
     def __init__(self, link: RobotLink, robot_model: dict, config: RuntimeConfig | None = None,
                  out_dir: Path | None = None, segmenter: Segmenter | None = None, arm: Arm | None = None):
         """``arm`` is the body's planar arm (:mod:`steward.ego.arm`); without one the body is the
         mobile kitchen robot, whose lift, reach slide and wrist are the planar arm itself."""
         self.link = link
         self.config = config or RuntimeConfig()
+        if _assembly_enabled():
+            self.capability_configuration = capabilities.snapshot()
+            self.capability_configuration['runtime'] = dict(perceptionHz=self.config.perception_hz,
+                decisionObservation=self.config.decision_observation)
+            self._configuration_pending = True
+            import json
+            print('STEWARD_CAPABILITIES ' + json.dumps(self.capability_configuration, sort_keys=True), file=sys.stderr, flush=True)
+            from steward.ego.receipt_log import configuration
+            configuration(self.capability_configuration)
         if self.config.localization_apply and self.config.localization_config is None:
             raise ValueError("localization_apply requires localization_config")
         if not math.isfinite(self.config.localization_interval_s) or self.config.localization_interval_s <= 0:
@@ -375,6 +526,17 @@ class EgoRuntime:
             self.estimator.config.semantic_shape_weight = segmenter.config.shape_weight
             self.estimator.config.semantic_label_floor = segmenter.config.label_floor
         self._keyframe: dict[str, dict] = {}  # camera → sensor header of its last segmented frame
+        if _assembly_enabled():
+            self._observation_io = threading.RLock()
+            self.observation_audit = decision_views.Audit()
+            self._decision_frames = {}
+            self._previous_decision_frames = {}
+            self._fused_stamps = {}
+            self._latest_segmented_frames = {}
+            self._decision_samples = {}
+            self.decision_motion = {}
+            self._observation_reason = 'periodic'
+            self._observation_skill = None
         self._pose_sample: tuple[float, float, float] | None = None
         self._still_since: float | None = None
         self._missing_cameras: frozenset[str] = frozenset()
@@ -382,12 +544,24 @@ class EgoRuntime:
                              "lastError": None}
         self.esim = Esim(robot_model, self.config.esim, arm)
         self.arm = self.esim.arm
+        self._arm_esims: dict[str, Esim] = {}
+        if isinstance(self.arm, PiperArm):
+            for side in ("L", "R"):
+                planner = (self.esim if side == self.arm.config.arm else
+                           Esim(robot_model, self.config.esim,
+                                PiperArm(robot_model, replace(self.arm.config, arm=side))))
+                planner._ids = self.esim._ids
+                self._arm_esims[side] = planner
+        self._arm_selection_lock = threading.RLock()
         self.out_dir = out_dir
+        if _assembly_enabled():
+            self.estimator.precision_probe_path = out_dir / 'precision_probe.jsonl' if out_dir is not None else None
         self._lock = threading.RLock()
         self._running = False
         self._thread: threading.Thread | None = None
         self.receipts: dict[str, dict] = {}
         self.last_error: str | None = None
+        self._last_clock_alert: str | None = None
         self.control_owner: str | None = None
         self.perception_mode: str | None = None
         self.alerts: list[dict] = []
@@ -405,31 +579,75 @@ class EgoRuntime:
         self._input_lock = threading.Lock()
         self.inputs: list[dict] = []  # Ego API requests as applied, with their world time (:meth:`apply`)
         self._alert_ids = itertools.count(1)
-        self.executor = SkillExecutor(lambda cmd: self.link.command(self.arm.command(cmd)), self._motion_state,
-                                      self._mark_held, self.config.motion,
-                                      shift=self._shift_track, on_error=lambda msg: self.alert(msg, "skill"),
-                                      on_finish=self._skill_finished, on_release=self._released,
-                                      placement_evidence=self._placement_evidence,
-                                      on_release_target=self._released,
-                                      assemble_onto=self._assemble_onto,
-                                      fasten=self._fasten,
-                                      validate_placement=self._validate_placement,
-                                      on_begin=self._skill_begin, clock=self.link,
-                                      closed_drawers=self._closed_drawer_ids, drawer_plan=self._drawer_plan,
-                                      pin=self._pin_track, furniture=self._furniture_id,
-                                      contents=self._content_ids, content_positions=self._content_positions,
-                                      resettle=self._resettle_contents,
-                                      home_empty=lambda tick: self.arm.home_empty(self.link.command, tick),
-                                      deploy_working=(lambda tick: self.arm.deploy_working(self.link.command, tick)
-                                                      if callable(getattr(self.arm, "deploy_working", None))
-                                                      else None),
-                                      verify_screw_seat=self._verify_screw_seat,
-                                      replan_pick=self._replan_pick,
-                                      replan_insert_place=self._replan_insert_place)
+        if _assembly_enabled():
+            self.executor = SkillExecutor(lambda cmd: self.link.command(self.arm.command(cmd)), self._motion_state,
+                                          self._mark_held, self.config.motion,
+                                          shift=self._shift_track, on_error=lambda msg: self.alert(msg, "skill"),
+                                          on_finish=self._skill_finished, on_release=self._released,
+                                          placement_evidence=self._placement_evidence,
+                                          on_release_target=self._released,
+                                          assemble_onto=self._assemble_onto,
+                                          fasten=self._fasten,
+                                          validate_placement=self._validate_placement,
+                                          prepare_place_surface=self._prepare_place_surface,
+                                          on_begin=self._skill_begin, clock=self.link,
+                                          closed_drawers=self._closed_drawer_ids, drawer_plan=self._drawer_plan,
+                                          pin=self._pin_track, furniture=self._furniture_id,
+                                          contents=self._content_ids, content_positions=self._content_positions,
+                                          resettle=self._resettle_contents,
+                                          home_empty=lambda tick: self.arm.home_empty(self.link.command, tick),
+                                          deploy_working=(lambda tick: self.arm.deploy_working(self.link.command, tick)
+                                                          if callable(getattr(self.arm, "deploy_working", None))
+                                                          else None),
+                                          motion_policy=self.arm.motion_policy)
+            from steward.ego.assembly_release_height import enforce_floor
+            self.executor._assembly_release_floor = lambda plan: enforce_floor(self, plan)
+            self.executor._frame_period_s = self.config.keyframe_max_s
+            self.executor._observe_decision = self._observe_decision
+            from steward.ego.grasp_diagnostics import after_lift
+            self.executor._grasp_diagnostic_after_lift = lambda eid: after_lift(self, eid)
+            from steward.ego.hand_observation import after_lift as inspect_hand
+            self.executor._inspect_hand_after_lift = lambda eid, **kw: inspect_hand(self, eid, **kw)
+            from steward.ego.grasp_binding import after_lift as verify_load, receipt as load_receipt
+            self.executor._verify_load_after_lift = lambda eid, job, plan, pickup: verify_load(self, eid, job, plan, pickup)
+            self.executor._load_binding_receipt = lambda eid: load_receipt(self.estimator, eid)
+            def remember_binding_target(plan):
+                from steward.ego.grasp_binding import enabled
+                if enabled():
+                    with self._lock:
+                        self.estimator._binding_pickup_snapshot = deepcopy(self.estimator.tracks.get(plan['target']))
+            self.executor._prepare_load_binding = remember_binding_target
+            from steward.ego.memory_checkpoint import create
+            self._memory_checkpoint = create(self)
+        else:
+            self.executor = SkillExecutor(lambda cmd: self.link.command(self.arm.command(cmd)), self._motion_state,
+                                          self._mark_held, self.config.motion,
+                                          shift=self._shift_track, on_error=lambda msg: self.alert(msg, "skill"),
+                                          on_finish=self._skill_finished, on_release=self._released,
+                                          posterior=self._posterior_look, fastened=self._fastened,
+                                          placement_evidence=self._placement_evidence,
+                                          on_release_target=self._released,
+                                          assemble_onto=self._assemble_onto,
+                                          fasten=self._fasten,
+                                          validate_placement=self._validate_placement,
+                                          on_begin=self._skill_begin, clock=self.link,
+                                          closed_drawers=self._closed_drawer_ids, drawer_plan=self._drawer_plan,
+                                          pin=self._pin_track, furniture=self._furniture_id,
+                                          contents=self._content_ids, content_positions=self._content_positions,
+                                          resettle=self._resettle_contents,
+                                          home_empty=lambda tick: self.arm.home_empty(self.link.command, tick),
+                                          deploy_working=(lambda tick: self.arm.deploy_working(self.link.command, tick)
+                                                          if callable(getattr(self.arm, "deploy_working", None))
+                                                          else None),
+                                          verify_screw_seat=self._verify_screw_seat,
+                                          replan_pick=self._replan_pick,
+                                          replan_insert_place=self._replan_insert_place,
+                                          motion_policy=self.arm.motion_policy)
         self._view_scene: tuple[dict, int, float] | None = None  # (ES dict, version, stamp) for the view
         # The belief part of the motion state, recorded under ``_lock`` at each read and around each
         # perception update; :meth:`_motion_state` falls back on it while another thread holds the lock.
         self._motion_belief: dict | None = None
+        self._latest_frame: dict | None = None  # the perception loop's latest primary camera frame, for fresh looks
         self.face_error: str | None = None  # why the latest camera image for faces could not be fetched
         self._face_thread: threading.Thread | None = None
         from steward.ego.view import EgoViewRenderer
@@ -455,68 +673,330 @@ class EgoRuntime:
         for thread in (self._thread, self._face_thread):
             if thread is not None:
                 thread.join(timeout=2.0)
+        if _assembly_enabled():
+            memory = getattr(self, '_memory_checkpoint', None)
+            if memory is not None:
+                # Lifecycle barrier only; control/perception never wait for disk.
+                try: memory.flush(timeout=2.0)
+                except TimeoutError: pass
 
-    def _poll_once(self) -> None:
-        frame = self.link.sensors()
-        if frame.get("imaging") != "rgbd":
-            mode = "detections"
-        else:
-            mode = "rgbd" if frame.get("masks", True) else "rgbd-segmenter"
-        # A fast look-around steps farther than the heading window in which a long table is fully
-        # inside the head camera, and a border-truncated region does not start a track. Slow the
-        # turn only while perception keeps keyframes; fusing every frame already samples that window.
-        self.executor._keyframed = mode == "rgbd-segmenter"
-        if mode != self.perception_mode:
-            with self._lock:
-                if self.perception_mode is not None:
-                    # The sensors changed kind (a phase switch): objects are perceived afresh with
-                    # the new pipeline; what the gripper holds and the running skill are kept.
-                    self.estimator.forget_objects()
-                self.perception_mode = mode
-                self.segmentation_preview.clear()
-                self._keyframe = {}
-                self._pose_sample = None
-                self._still_since = None
-        cameras = self._cameras(frame)
-        if mode in ("rgbd", "rgbd-segmenter"):
-            due = [c for c in cameras if mode == "rgbd" or self._keyframe_due(frame, c)]
-            whole = [decode_rgbd(self.link.rgbd(camera)) for camera in due]
-            if mode == "rgbd-segmenter":
-                whole = [rgbd for rgbd in whole if not self._idle_near_frame(rgbd)]
-            pairs = [(decimated(rgbd, self._perception_rows(rgbd), self.config.depth_join), rgbd) for rgbd in whole]
-            unmasked = [pair for pair in pairs if pair[0]["mask"] is None]
-            if unmasked and not self._segment(unmasked):
-                pairs = [pair for pair in pairs if pair[0]["mask"] is not None]
-            frames = [rgbd for rgbd, _whole in pairs]
-            localization_frames = self._localization_frames(frame, frames)
+    if _assembly_enabled():
+        def _poll_once(self, decision=None) -> None:
+            # Worker and action-boundary captures share one IO owner. A decision
+            # already holds the input/skill clock, so it must not wait for the worker.
+            with self._observation_io:
+                old = getattr(self, '_observation_reason', 'periodic')
+                if not hasattr(self, '_keyframe'):
+                    self._keyframe = {}
+                if not hasattr(self, '_fused_stamps'):
+                    self._fused_stamps = {}
+                if not hasattr(self, '_latest_segmented_frames'):
+                    self._latest_segmented_frames = {}
+                self._observation_reason = decision or 'periodic'
+                try:
+                    self._poll_observation(decision)
+                    memory = getattr(self, "_memory_checkpoint", None)
+                    if memory is not None:
+                        with self._lock:
+                            memory.after_observation()
+                finally:
+                    self._observation_reason = old
+    else:
+        def _poll_once(self) -> None:
+            frame = self.link.sensors()
+            if frame.get("imaging") != "rgbd":
+                mode = "detections"
+            else:
+                mode = "rgbd" if frame.get("masks", True) else "rgbd-segmenter"
+            # A fast look-around steps farther than the heading window in which a long table is fully
+            # inside the head camera, and a border-truncated region does not start a track. Slow the
+            # turn only while perception keeps keyframes; fusing every frame already samples that window.
+            self.executor._keyframed = mode == "rgbd-segmenter"
+            if mode != self.perception_mode:
+                with self._lock:
+                    if self.perception_mode is not None:
+                        # The sensors changed kind (a phase switch): objects are perceived afresh with
+                        # the new pipeline; what the gripper holds and the running skill are kept.
+                        self.estimator.forget_objects()
+                    self.perception_mode = mode
+                    self.segmentation_preview.clear()
+                    self._keyframe = {}
+                    self._pose_sample = None
+                    self._still_since = None
+            cameras = self._cameras(frame)
+            if mode in ("rgbd", "rgbd-segmenter"):
+                due = [c for c in cameras if mode == "rgbd" or self._keyframe_due(frame, c)]
+                whole = [decode_rgbd(self.link.rgbd(camera)) for camera in due]
+                if mode == "rgbd" and whole:
+                    # Keep the primary camera's frame for fresh looks: renders stay on this thread
+                    # alone. One fetched from a skill thread starves against that skill's own clock
+                    # hold (the world does not pump while pinned) and interleaves its mask-shuffle
+                    # draws with perception's, so a recorded run would no longer replay exactly.
+                    self._latest_frame = whole[0]
+                if mode == "rgbd-segmenter":
+                    whole = [rgbd for rgbd in whole if not self._idle_near_frame(rgbd)]
+                pairs = [(decimated(rgbd, self._perception_rows(rgbd), self.config.depth_join), rgbd) for rgbd in whole]
+                unmasked = [pair for pair in pairs if pair[0]["mask"] is None]
+                if unmasked and not self._segment(unmasked):
+                    pairs = [pair for pair in pairs if pair[0]["mask"] is not None]
+                frames = [rgbd for rgbd, _whole in pairs]
+                localization_frames = self._localization_frames(frame, frames)
+                with self._lock:
+                    if self._new_episode(frame):
+                        self._restart()
+                    self._advance_localization(frame, localization_frames)
+                    frame = self._feedback_header(frame)
+                    pairs = [(self._feedback_frame(rgbd), self._feedback_frame(full)) for rgbd, full in pairs]
+                    frames = [rgbd for rgbd, _whole in pairs]
+                    self._keep_motion_belief()  # what a motion loop reads while this update runs
+                    if not frames:
+                        self.estimator.update_body(frame)
+                    for rgbd, full in pairs:
+                        self.estimator.update_rgbd(rgbd, defer=self._handoff(rgbd, frames))
+                        self._look_at_faces(full)
+                    self._publish_view_scene()
+                    self._keep_motion_belief()
+                return
+            frame = {**frame, "cameras": [c for c in frame.get("cameras", []) if c["id"] in cameras],
+                     "detections": [d for d in frame.get("detections", []) if d.get("camera") in cameras]}
+            localization_frames = self._localization_frames(frame, [])
+            self._latest_frame = frame  # fresh looks read this frame; renders stay on this thread alone
             with self._lock:
                 if self._new_episode(frame):
                     self._restart()
                 self._advance_localization(frame, localization_frames)
                 frame = self._feedback_header(frame)
-                pairs = [(self._feedback_frame(rgbd), self._feedback_frame(full)) for rgbd, full in pairs]
-                frames = [rgbd for rgbd, _whole in pairs]
                 self._keep_motion_belief()  # what a motion loop reads while this update runs
-                if not frames:
-                    self.estimator.update_body(frame)
-                for rgbd, full in pairs:
-                    self.estimator.update_rgbd(rgbd, defer=self._handoff(rgbd, frames))
-                    self._look_at_faces(full)
+                self.estimator.update(frame)
                 self._publish_view_scene()
                 self._keep_motion_belief()
-            return
-        frame = {**frame, "cameras": [c for c in frame.get("cameras", []) if c["id"] in cameras],
-                 "detections": [d for d in frame.get("detections", []) if d.get("camera") in cameras]}
-        localization_frames = self._localization_frames(frame, [])
-        with self._lock:
-            if self._new_episode(frame):
-                self._restart()
-            self._advance_localization(frame, localization_frames)
-            frame = self._feedback_header(frame)
-            self._keep_motion_belief()  # what a motion loop reads while this update runs
-            self.estimator.update(frame)
-            self._publish_view_scene()
-            self._keep_motion_belief()
+
+    if _assembly_enabled():
+        def _observe_decision(self, reason, skill=None):
+            if not decision_views.enabled(self) or not getattr(self, '_running', False):
+                return
+            if (self.executor._stop.is_set() and
+                    getattr(self.executor, '_observation_thread', None) == threading.get_ident()):
+                return
+            with self._observation_io:
+                old = self._observation_skill
+                self._observation_skill = skill
+                try:
+                    from steward.ego.assembly_session import check_budget
+                    check_budget()
+                    # Reuse the caller's hold; acquiring a second clock hold here
+                    # would deadlock behind the action that requested this look.
+                    _, _, owner = decision_views.context(self.executor)
+                    on_worker = owner == threading.get_ident() or getattr(
+                        self.executor, '_observation_thread', None) == threading.get_ident()
+                    hold = (self.executor._hold if on_worker else 'input') or 'input'
+                    with self._holding(hold):
+                        self._poll_once(decision=reason)
+                except Exception as exc:
+                    # A missing frame adds no new admission/confirmation gate.
+                    self.observation_audit.errors += 1
+                    self.observation_audit.emit('error', reason=reason, error=type(exc).__name__)
+                finally:
+                    self._observation_skill = old
+
+        def _observation_context(self):
+            skill, phase, _ = decision_views.context(self.executor)
+            return dict(skill=getattr(self, '_observation_skill', None) or skill, phase=phase,
+                        reason=getattr(self, '_observation_reason', 'periodic'))
+
+        def _poll_observation(self, decision=None) -> None:
+            frame = self.link.sensors()
+            memory = getattr(self, "_memory_checkpoint", None)
+            if memory is not None:
+                memory.before_observation(frame)
+            with self._lock:
+                if self._new_episode(frame):
+                    self._restart()
+            if frame.get("imaging") != "rgbd":
+                mode = "detections"
+            else:
+                mode = "rgbd" if frame.get("masks", True) else "rgbd-segmenter"
+            # A fast look-around steps farther than the heading window in which a long table is fully
+            # inside the head camera, and a border-truncated region does not start a track. Slow the
+            # turn only while perception keeps keyframes; fusing every frame already samples that window.
+            self.executor._keyframed = mode == "rgbd-segmenter"
+            if mode != self.perception_mode:
+                with self._lock:
+                    if self.perception_mode is not None:
+                        # The sensors changed kind (a phase switch): objects are perceived afresh with
+                        # the new pipeline; what the gripper holds and the running skill are kept.
+                        self.estimator.forget_objects()
+                    self.perception_mode = mode
+                    self.segmentation_preview.clear()
+                    self._keyframe = {}
+                    self._fused_stamps = {}
+                    self._latest_segmented_frames = {}
+                    self._decision_frames, self._previous_decision_frames = {}, {}
+                    self._decision_samples, self.decision_motion = {}, {}
+                    self.observation_audit.latest.clear()
+                    self._pose_sample = None
+                    self._still_since = None
+            cameras = self._cameras(frame)
+            if mode in ("rgbd", "rgbd-segmenter"):
+                sparse = decision_views.enabled(self) and getattr(self, '_running', False)
+                _, phase, _ = decision_views.context(self.executor)
+                request = getattr(self, '_precision_view_request', None)
+                requested = (sparse and request and request.get('cameras') and not request.get('captured')
+                             and frame['stamp'] > request['after'])
+                force = decision or requested
+                periodic_anchors = dict(self._keyframe) if force else {}
+                due = [c for c in cameras if (
+                    (force and (self._fused_stamps.get(c) != frame['stamp']
+                               or requested and c in request['cameras']))
+                    or (not force and (mode == 'rgbd' and (not sparse or phase in ('precision', 'survey'))
+                                         or self._keyframe_due(frame, c))))]
+                targeted = set(request['cameras']) & set(due) if request and not request.get('captured') and frame['stamp'] > request['after'] else set()
+                if targeted:
+                    self._observation_reason = 'targeted_request'
+                whole = [decode_rgbd(self.link.rgbd(camera)) for camera in due]
+                if mode == "rgbd" and whole:
+                    self._latest_frame = whole[0]
+                self._latest_native_frames = {**getattr(self, '_latest_native_frames', {}),
+                                              **{f['camera']: f for f in whole}}
+                if targeted:
+                    request['captured'] = True
+                    self._precision_native_frames = {f['camera']: f for f in whole if f['camera'] in targeted}
+                    request['nativeResolutions'] = {f['camera']: [int(f['rgb'].shape[1]), int(f['rgb'].shape[0])]
+                        for f in whole if f['camera'] in targeted and 'rgb' in f}
+                if mode == "rgbd-segmenter" and not force:
+                    whole = [rgbd for rgbd in whole if rgbd['camera'] in targeted or not self._idle_near_frame(rgbd)]
+                pairs = [(rgbd if rgbd['camera'] in targeted else
+                          decimated(rgbd, self._perception_rows(rgbd), self.config.depth_join), rgbd) for rgbd in whole]
+                unmasked = [pair for pair in pairs if pair[0]["mask"] is None]
+                if unmasked and not self._segment(unmasked):
+                    pairs = [pair for pair in pairs if pair[0]["mask"] is not None]
+                # Additional decision views must not postpone a fine phase's next
+                # periodic view. Only the originally requested cameras replace the
+                # periodic anchor, as they did before decision scheduling.
+                for camera, anchor in periodic_anchors.items():
+                    if camera not in targeted:
+                        self._keyframe[camera] = anchor
+                frames = [rgbd for rgbd, _whole in pairs]
+                localization_frames = self._localization_frames(frame, frames)
+                with self._lock:
+                    if self._new_episode(frame):
+                        self._restart()
+                    self._advance_localization(frame, localization_frames)
+                    frame = self._feedback_header(frame)
+                    pairs = [(self._feedback_frame(rgbd), self._feedback_frame(full)) for rgbd, full in pairs]
+                    frames = [rgbd for rgbd, _whole in pairs]
+                    self._keep_motion_belief()  # what a motion loop reads while this update runs
+                    if not frames:
+                        self.estimator.update_body(frame)
+                        self.observation_audit.body_updates += 1
+                    precision_samples, recovered = {}, 0
+                    for rgbd, full in pairs:
+                        from steward.ego.support_registration import motion_due, observe_motion
+                        if motion_due(self, full):
+                            # Reuse the existing anonymous mask at native RGB-D scale;
+                            # small recesses must not vanish in the ordinary decimator.
+                            motion_frame = full
+                            if full.get('mask') is None and rgbd.get('mask') is not None:
+                                native_mask = np.asarray(Image.fromarray(rgbd['mask'].astype(np.int32)).resize(
+                                    (full['rgb'].shape[1], full['rgb'].shape[0]), Image.Resampling.NEAREST))
+                                motion_frame = dict(full, mask=native_mask)
+                            observe_motion(self, motion_frame)
+                        precision_targets = tuple(request.get('entities', ())) if rgbd['camera'] in targeted else ()
+                        if precision_targets:
+                            result = self.estimator.update_rgbd(rgbd, precision_targets=precision_targets)
+                            recovered += (result or {}).get('associationRecoveredCount', 0)
+                            for eid in precision_targets:
+                                track = self.estimator.tracks.get(eid)
+                                if track is not None and track.manipulation_view is not None:
+                                    precision_samples[eid] = track.manipulation_view
+                        else:
+                            self.estimator.update_rgbd(rgbd, defer=None if rgbd['camera'] in targeted else self._handoff(rgbd, frames))
+                        from steward.ego.grasp_diagnostics import cache_views
+                        cache_views(self, rgbd, full)
+                        self._look_at_faces(full)
+                        if rgbd['camera'] not in periodic_anchors or rgbd['camera'] in targeted:
+                            self._keyframe[rgbd['camera']] = rgbd['header']
+                        full['_observation_id'] = self.observation_audit.processed(
+                            rgbd, **self._observation_context(), fused=True)
+                        self._fused_stamps[rgbd['camera']] = rgbd['header']['stamp']
+                        self._latest_segmented_frames[rgbd['camera']] = rgbd
+                    if decision or targeted:
+                        self._remember_decision_frames([(f, f) for c, f in self._latest_native_frames.items()
+                            if self._fused_stamps.get(c) == f['header']['stamp']])
+                    if targeted:
+                        # A later camera without this target must not erase a valid
+                        # independently assigned view from another camera in the batch.
+                        for eid in request.get('entities', ()):
+                            track = self.estimator.tracks.get(eid)
+                            if track is not None:
+                                track.manipulation_view = precision_samples.get(eid)
+                        if request.get('entities'):
+                            request.update(associationMode='independent_masks_v1',
+                                targetViewCount=len(precision_samples), associationRecoveredCount=recovered)
+                        request['completed'] = True
+                        request['frameStamps'] = [rgbd['header']['stamp'] for rgbd in frames if rgbd['camera'] in targeted]
+                    self._publish_view_scene()
+                    self._keep_motion_belief()
+                return
+            frame = {**frame, "cameras": [c for c in frame.get("cameras", []) if c["id"] in cameras],
+                     "detections": [d for d in frame.get("detections", []) if d.get("camera") in cameras]}
+            localization_frames = self._localization_frames(frame, [])
+            self._latest_frame = frame
+            with self._lock:
+                if self._new_episode(frame):
+                    self._restart()
+                self._advance_localization(frame, localization_frames)
+                frame = self._feedback_header(frame)
+                self._keep_motion_belief()  # what a motion loop reads while this update runs
+                self.estimator.update(frame)
+                self._publish_view_scene()
+                self._keep_motion_belief()
+
+        def _remember_decision_frames(self, pairs):
+            # Keep each camera's previous decision, not the previous encoder tick.
+            # Native pixels carry their own pose/stamp; existing feature-motion
+            # checks still compare against their saved registration at this instant.
+            if not hasattr(self, '_decision_frames'):
+                self._decision_frames, self._previous_decision_frames = {}, {}
+            for raw, full in pairs:
+                camera = raw['camera']
+                previous = self._decision_frames.get(camera)
+                if previous is not None and previous['header']['stamp'] != full['header']['stamp']:
+                    self._previous_decision_frames[camera] = previous
+                full['_observation_id'] = raw.get('_observation_id')
+                self._decision_frames[camera] = full
+            # Object motion is measured between observations, never against the
+            # encoder clock advanced by sparse updates. Held objects are followed
+            # by FK and are not independently measured object velocities.
+            previous = getattr(self, '_decision_samples', {})
+            current, motion = {}, {}
+            stamps = {full['header']['stamp'] for _, full in pairs}
+            for track in self.estimator.tracks.values():
+                if track.held or track.last_seen not in stamps:
+                    continue
+                point = np.asarray(track.pos, float).copy()
+                current[track.id] = (track.last_seen, point)
+                prior = previous.get(track.id)
+                if prior is not None and track.last_seen > prior[0]:
+                    dt = track.last_seen - prior[0]
+                    motion[track.id] = dict(previousAt=prior[0], observedAt=track.last_seen,
+                        displacementM=(point-prior[1]).tolist(), velocityMps=((point-prior[1])/dt).tolist(),
+                        source='decision_observation_pair')
+            if current:
+                # Co-timed nested action boundaries reuse the same pair.
+                if any(k not in previous or v[0] != previous[k][0] for k,v in current.items()):
+                    self.decision_motion = motion
+                    self._decision_samples = current
+
+        def decision_history(self, camera):
+            """Current and previous decision pixels, with their original pose/stamp."""
+            with self._lock:
+                frames = (getattr(self, '_previous_decision_frames', {}).get(camera),
+                          getattr(self, '_decision_frames', {}).get(camera))
+                self.observation_audit.consume(decision_views.context(self.executor)[0],
+                    [f['_observation_id'] for f in frames if f is not None and f.get('_observation_id')],
+                    'decision_history_read')
+                return frames
 
     def localization_status(self) -> dict:
         """Snapshot of optional continuous localization, including prediction/rejection status.
@@ -611,8 +1091,14 @@ class EgoRuntime:
         """The cameras to perceive with: those of the robot model (or ``RuntimeConfig.cameras``) that
         the world's robot provides, primary first. A camera the world lacks (its scene was built
         with an older robot model) is reported once as an operator alert."""
-        wanted = [c for c in self.estimator.cameras if self.config.cameras is None or c in self.config.cameras]
+        if _assembly_enabled():
+            wanted = [c for c, (_, sensor) in self.estimator.cameras.items()
+                      if not sensor.get("onDemand") and (self.config.cameras is None or c in self.config.cameras)]
+        else:
+            wanted = [c for c in self.estimator.cameras if self.config.cameras is None or c in self.config.cameras]
         provided = {c["id"] for c in frame.get("cameras", [])}
+        if _assembly_enabled():
+            self._provided_camera_ids = provided
         missing = frozenset(c for c in wanted if c not in provided)
         if missing and missing != self._missing_cameras:
             self.alert(f"世界中的机器人没有相机 {', '.join(sorted(missing))}：场景可能按旧的机器人模型构建，"
@@ -623,7 +1109,11 @@ class EgoRuntime:
     def _resolve_near_camera(self) -> str | None:
         """The camera in charge of near regions (:attr:`RuntimeConfig.near_camera`); None when
         perception uses a single camera. Raises ``ValueError`` for a camera perception does not use."""
-        used = [c for c in self.estimator.cameras if self.config.cameras is None or c in self.config.cameras]
+        if _assembly_enabled():
+            used = [c for c, (_, sensor) in self.estimator.cameras.items()
+                    if not sensor.get("onDemand") and (self.config.cameras is None or c in self.config.cameras)]
+        else:
+            used = [c for c in self.estimator.cameras if self.config.cameras is None or c in self.config.cameras]
         if self.config.near_camera is not None:
             if self.config.near_camera not in used:
                 raise ValueError(f"RuntimeConfig.near_camera {self.config.near_camera!r} is not a camera perception "
@@ -647,9 +1137,44 @@ class EgoRuntime:
         if shifted:
             self._still_since = stamp
 
+    if _assembly_enabled():
+        def request_precision_view(self, targets, after):
+            """One local RGB-D acquisition; camera choice uses only robot calibration.
+
+            The normal perception worker owns camera/segmenter IO. A request forces
+            fresh keyframes without starting a second segmentation service call.
+            """
+            with self._lock:
+                est = self.estimator
+                configured = getattr(self.config, 'cameras', None)
+                used = [c for c, (_, sensor) in est.cameras.items()
+                        if not sensor.get("onDemand") and (configured is None or c in configured)]
+                cameras = [c for c in used if any(
+                    np.linalg.norm(np.asarray(p)-est.camera_pose(camera=c)['p']) <= .8 and
+                    in_view(est.camera_pose(camera=c), est.camera_intrinsics(c), p, 0.) for p in targets)]
+                request = dict(after=after, cameras=cameras, requested=True,
+                               reason='targeted_fresh_frame' if cameras else 'no_close_camera_in_fov')
+                self._precision_view_request = request
+                return request
+
+        def finish_precision_view(self, request):
+            with self._lock:
+                if getattr(self, '_precision_view_request', None) is request:
+                    self._precision_view_request = None
+
     def _keyframe_due(self, frame: dict, camera: str) -> bool:
+        if _assembly_enabled():
+            request = getattr(self, '_precision_view_request', None)
+            if (request and camera in request['cameras'] and not request.get('captured')
+                    and frame['stamp'] > request['after']):
+                return True
         cfg, last = self.config, self._keyframe.get(camera)
         self._note_pose(frame)
+        if _assembly_enabled():
+            if (decision_views.enabled(self) and getattr(self, '_running', False) and last is not None
+                    and decision_views.context(self.executor)[1] in ('transport', 'idle')
+                    and not self.executor._look):
+                return False
         if last is None:
             return True
         odo, was = frame["odometry"], last["odometry"]
@@ -674,10 +1199,16 @@ class EgoRuntime:
         return elapsed >= cfg.keyframe_min_s and (moved or turned or handled or settled)
 
     def _arm_moved(self, last: dict, frame: dict) -> bool:
-        """Whether the arm or gripper changed enough since ``last`` for a new near-camera keyframe."""
-        grip, was = frame["gripper"], last["gripper"]
-        if grip.get("state") != was.get("state") or bool(grip.get("holding")) != bool(was.get("holding")):
+        """Whether arm motion or any gripper's state changed enough for a near-camera keyframe."""
+        grips = frame.get("grippers") or {"gripper": frame["gripper"]}
+        previous = last.get("grippers") or {"gripper": last["gripper"]}
+        if grips.keys() != previous.keys():
             return True
+        for lid, grip in grips.items():
+            was = previous[lid]
+            if (grip.get("state") != was.get("state")
+                    or any(bool(grip.get(key)) != bool(was.get(key)) for key in ("holding", "holdingHandle"))):
+                return True
         for jid, kind in self._arm_joints.items():
             if jid not in frame["joints"] or jid not in last["joints"]:
                 continue
@@ -784,39 +1315,74 @@ class EgoRuntime:
         for rgbd, _whole in pairs:
             self._keyframe[rgbd["camera"]] = rgbd["header"]
         stats = self.segmentation
-        if self.segmenter is None:
-            error = "this phase level sends no instance masks and the robot has no segmenter (steward ego --segmentation-config)"
-        else:
-            try:
-                # What the depth alone shows is worked out while the service is asked about the
-                # colours: the wait for its answer is otherwise idle, and longer than this work.
-                with ThreadPoolExecutor(max_workers=len(pairs), thread_name_prefix="depth") as pool:
-                    ahead = [pool.submit(self._depth_clusters, rgbd) for rgbd, _whole in pairs]
-                    results = self.segmenter.segment_frames(
-                        [(rgbd["rgb"], None if whole is rgbd else whole["rgb"]) for rgbd, whole in pairs])
-                    views = [future.result() for future in ahead]
-                zoomed = self.segmenter.zoom_frames(
-                    [(result, rgbd["rgb"], depth, rgbd["fovy"], up_cam, None if whole is rgbd else whole["rgb"])
-                     for (rgbd, whole), result, (depth, up_cam, _clusters) in zip(pairs, results, views)],
-                    [clusters for _depth, _up_cam, clusters in views])
-                for (rgbd, _whole), result, (depth, up_cam, clusters) in zip(pairs, zoomed, views):
-                    result = self.segmenter.fill(result, depth, rgbd["fovy"], up_cam, clusters)
-                    result = self.segmenter.peel(result, rgbd["rgb"], depth, rgbd["fovy"])
-                    rgbd["mask"], rgbd["labels"] = result.mask, result.labels
-            except SegmenterError as exc:
-                error = str(exc)
-                for rgbd, _whole in pairs:
-                    rgbd["mask"] = None
+        if _assembly_enabled():
+            if self.segmenter is None:
+                error = "this phase level sends no instance masks and the robot has no segmenter (steward ego --segmentation-config)"
             else:
-                for (rgbd, _whole), result in zip(pairs, zoomed):
-                    self.segmentation_preview.publish(rgbd["camera"], rgbd["header"]["stamp"], rgbd["rgb"], result)
-                stats["frames"] += len(results)
-                stats["cached"] += sum(result.cached for result in results)
-                asked = [result.seconds for result in results if not result.cached]
-                if asked:
-                    stats["lastSeconds"] = round(max(asked), 2)
-                stats["lastError"] = None
-                return True
+                try:
+                    # What the depth alone shows is worked out while the service is asked about the
+                    # colours: the wait for its answer is otherwise idle, and longer than this work.
+                    with ThreadPoolExecutor(max_workers=len(pairs), thread_name_prefix="depth") as pool:
+                        ahead = [pool.submit(self._depth_clusters, rgbd) for rgbd, _whole in pairs]
+                        results = self.segmenter.segment_frames(
+                            [(rgbd["rgb"], None if whole is rgbd else whole["rgb"]) for rgbd, whole in pairs])
+                        views = [future.result() for future in ahead]
+                    zoomed = self.segmenter.zoom_frames(
+                        [(result, rgbd["rgb"], depth, rgbd["fovy"], up_cam, None if whole is rgbd else whole["rgb"])
+                         for (rgbd, whole), result, (depth, up_cam, _clusters) in zip(pairs, results, views)],
+                        [clusters for _depth, _up_cam, clusters in views])
+                    for (rgbd, _whole), result, (depth, up_cam, clusters) in zip(pairs, zoomed, views):
+                        result = self.segmenter.fill(result, depth, rgbd["fovy"], up_cam, clusters)
+                        result = self.segmenter.peel(result, rgbd["rgb"], depth, rgbd["fovy"])
+                        rgbd["mask"], rgbd["labels"] = result.mask, result.labels
+                except SegmenterError as exc:
+                    error = str(exc)
+                    for rgbd, _whole in pairs:
+                        rgbd["mask"] = None
+                else:
+                    stats["frames"] += len(results)
+                    stats["cached"] += sum(result.cached for result in results)
+                    asked = [result.seconds for result in results if not result.cached]
+                    if asked:
+                        stats["lastSeconds"] = round(max(asked), 2)
+                    stats["lastError"] = None
+                    for rgbd, _ in pairs:
+                        self.observation_audit.processed(rgbd, **self._observation_context())
+                    return True
+        else:
+            if self.segmenter is None:
+                error = "this phase level sends no instance masks and the robot has no segmenter (steward ego --segmentation-config)"
+            else:
+                try:
+                    # What the depth alone shows is worked out while the service is asked about the
+                    # colours: the wait for its answer is otherwise idle, and longer than this work.
+                    with ThreadPoolExecutor(max_workers=len(pairs), thread_name_prefix="depth") as pool:
+                        ahead = [pool.submit(self._depth_clusters, rgbd) for rgbd, _whole in pairs]
+                        results = self.segmenter.segment_frames(
+                            [(rgbd["rgb"], None if whole is rgbd else whole["rgb"]) for rgbd, whole in pairs])
+                        views = [future.result() for future in ahead]
+                    zoomed = self.segmenter.zoom_frames(
+                        [(result, rgbd["rgb"], depth, rgbd["fovy"], up_cam, None if whole is rgbd else whole["rgb"])
+                         for (rgbd, whole), result, (depth, up_cam, _clusters) in zip(pairs, results, views)],
+                        [clusters for _depth, _up_cam, clusters in views])
+                    for (rgbd, _whole), result, (depth, up_cam, clusters) in zip(pairs, zoomed, views):
+                        result = self.segmenter.fill(result, depth, rgbd["fovy"], up_cam, clusters)
+                        result = self.segmenter.peel(result, rgbd["rgb"], depth, rgbd["fovy"])
+                        rgbd["mask"], rgbd["labels"] = result.mask, result.labels
+                except SegmenterError as exc:
+                    error = str(exc)
+                    for rgbd, _whole in pairs:
+                        rgbd["mask"] = None
+                else:
+                    for (rgbd, _whole), result in zip(pairs, zoomed):
+                        self.segmentation_preview.publish(rgbd["camera"], rgbd["header"]["stamp"], rgbd["rgb"], result)
+                    stats["frames"] += len(results)
+                    stats["cached"] += sum(result.cached for result in results)
+                    asked = [result.seconds for result in results if not result.cached]
+                    if asked:
+                        stats["lastSeconds"] = round(max(asked), 2)
+                    stats["lastError"] = None
+                    return True
         stats["failures"] += len(pairs)
         if stats["lastError"] is None:
             self.alert(f"图像分割失败，本帧只更新机器人自身状态：{error}", "runtime")
@@ -900,7 +1466,7 @@ class EgoRuntime:
         return renderer.render(ego, settings), "image/jpeg", {"esVersion": version, "t": round(stamp, 3)}
 
     def _new_episode(self, frame: dict) -> bool:
-        """Whether ``frame`` is from a new episode (the console's 重置 or a scenario load): its
+        """Whether ``frame`` is from a new episode (the console's reset action or a scenario load): its
         ``episode`` differs from the last frame's, or, from a world that numbers none, its clock
         went backwards. A reset at the very start of an episode leaves the clock where it was."""
         episode, self._episode = self._episode, frame.get("episode")
@@ -913,9 +1479,29 @@ class EgoRuntime:
         Ego-State and everything derived from it (receipts, roles, looks, keyframes) and
         cancel any running skill. Track ids start again at ``e:1``."""
         self.executor.cancel()
+        if _assembly_enabled():
+            from steward.ego.action_budget import Clock
+            self.executor._action_clock = Clock()
         self._generation += 1
         self.fault_monitor = FaultMonitor(self.config.fault_monitor)
+        if _assembly_enabled():
+            memory = getattr(self, "_memory_checkpoint", None)
+            if memory is not None:
+                memory.reset()
         self.estimator = EgoEstimator(robot_model=self.estimator.robot_model, config=self.estimator.config)
+        if _assembly_enabled():
+            self.estimator.precision_probe_path = self.out_dir / 'precision_probe.jsonl' if self.out_dir is not None else None
+            self._support_hole_watch = None
+            self._precision_view_request = None
+            self._precision_native_frames = {}
+            self._latest_native_frames = {}
+            self._decision_frames = {}
+            self._previous_decision_frames = {}
+            self._fused_stamps = {}
+            self._latest_segmented_frames = {}
+            self._decision_samples = {}
+            self.decision_motion = {}
+            self.observation_audit = decision_views.Audit()
         self.receipts.clear()
         self._receipt_generation.clear()  # skills predicted before now are of another episode
         self._roles.clear()
@@ -932,19 +1518,31 @@ class EgoRuntime:
         self._next_localization = 0.0
         self._localization_epoch = None
         self._localization_error = None
+        self._latest_frame = None  # another episode's pixels say nothing about this one's objects
 
     def _loop(self) -> None:
         """Perceive every ``1 / perception_hz`` seconds of world time, from the time the runtime started;
-        the world waits for each update but does not step for it alone (``freeze_idle``)."""
+        the world waits for each update but does not step for it alone (``freeze_idle``).
+        Each episode's first successful update is reported immediately, even while idle."""
         period = 1.0 / self.config.perception_hz
         telemetry_every = max(1, int(self.config.perception_hz / self.config.telemetry_hz))
         k = 0
+        telemetry_episode = object()
         t: float | None = None
         while self._running:
             try:
                 t = self.link.wait_until(None if t is None else t + period, "perception", pulls=False)
             except (HttpError, OSError) as exc:
                 self.last_error = f"robot port unavailable: {exc}"
+                time.sleep(period)
+                continue
+            except SkillFailed as exc:
+                # A paused world (a perception fault waiting for the operator) or a slow clock must not
+                # kill perception for the rest of the episode: log it once, keep waiting, resume on ack.
+                self.last_error = f"robot clock: {exc}"
+                if self.last_error != self._last_clock_alert:
+                    self._last_clock_alert = self.last_error
+                    self.alert(f"感知循环等待世界时钟失败：{exc}", "runtime")
                 time.sleep(period)
                 continue
             try:
@@ -954,9 +1552,11 @@ class EgoRuntime:
                 with self._holding("perception"):
                     self._poll_once()
                 k += 1
-                if k % telemetry_every == 0:
+                if self._episode != telemetry_episode or k % telemetry_every == 0:
                     self.link.telemetry(self._telemetry_scene())
+                    telemetry_episode = self._episode
                 self.last_error = None
+                self._last_clock_alert = None
             except (HttpError, OSError) as exc:
                 self.last_error = f"robot port unavailable: {exc}"
             except Exception as exc:  # noqa: BLE001 - perception must keep running; the operator is alerted
@@ -1000,19 +1600,40 @@ class EgoRuntime:
         # least as new as the one read: that one is the answer then.
         with self._lock:
             generation = self._generation
-        try:
-            live = self.link.sensors()
-        except Exception:  # noqa: BLE001 - the belief's own self pose is a usable answer when the body cannot be reached
-            live = None
-        with self._lock:
-            est = self.estimator
-            if live is not None and (generation != self._generation
-                                     or live.get("odometry") is None or live.get("stamp") is None
-                                     or live["stamp"] < est.stamp - 1e-6
-                                     or (live.get("episode") is not None and self._episode is not None
-                                         and live["episode"] != self._episode)):
-                live = None  # older than the belief, or another episode's body: the belief's own
-            return est.to_scene(self._feedback_header(live))
+        if _assembly_enabled():
+            try:
+                live = self.link.sensors()
+                memory = getattr(self, "_memory_checkpoint", None)
+                if memory is not None:
+                    memory.before_observation(live)
+            except Exception:  # noqa: BLE001 - the belief's own self pose is a usable answer when the body cannot be reached
+                live = None
+            with self._lock:
+                est = self.estimator
+                if live is not None and (generation != self._generation
+                                         or live.get("odometry") is None or live.get("stamp") is None
+                                         or live["stamp"] < est.stamp - 1e-6
+                                         or (live.get("episode") is not None and self._episode is not None
+                                             and live["episode"] != self._episode)):
+                    live = None  # older than the belief, or another episode's body: the belief's own
+                skill, _, owner = decision_views.context(self.executor)
+                if owner == threading.get_ident():
+                    self.observation_audit.consume(skill)
+                return est.to_scene(self._feedback_header(live))
+        else:
+            try:
+                live = self.link.sensors()
+            except Exception:  # noqa: BLE001 - the belief's own self pose is a usable answer when the body cannot be reached
+                live = None
+            with self._lock:
+                est = self.estimator
+                if live is not None and (generation != self._generation
+                                         or live.get("odometry") is None or live.get("stamp") is None
+                                         or live["stamp"] < est.stamp - 1e-6
+                                         or (live.get("episode") is not None and self._episode is not None
+                                             and live["episode"] != self._episode)):
+                    live = None  # older than the belief, or another episode's body: the belief's own
+                return est.to_scene(self._feedback_header(live))
 
     def _motion_state(self) -> dict:
         """What the body is doing now, for the motion loop.
@@ -1029,17 +1650,42 @@ class EgoRuntime:
         base still at the first set point. While another thread holds the lock, the objects are
         those recorded when the perception update in progress began (everything changed before
         it is in there) or at the last read, whichever came later."""
-        if self._lock.acquire(blocking=False):
-            try:
-                belief = self._keep_motion_belief()
-            finally:
-                self._lock.release()
-        else:
-            belief = self._motion_belief
-            if belief is None:  # nothing recorded yet: nothing to fall back on but waiting
-                with self._lock:
+        if _assembly_enabled():
+            if self._lock.acquire(blocking=False):
+                try:
                     belief = self._keep_motion_belief()
+                finally:
+                    self._lock.release()
+            else:
+                belief = self._motion_belief
+                if belief is None:  # obey the exploration budget even on the first belief read
+                    from steward.ego.look_timeout import active, remaining, LookExpired
+                    from steward.ego.fasten_sequence import active as drive_active
+                    acquired = self._lock.acquire(timeout=remaining(math.inf)) if active() or drive_active() else self._lock.acquire()
+                    if not acquired:
+                        remaining(math.inf)
+                        raise LookExpired('exploration waiting for initial belief')
+                    try:
+                        belief = self._keep_motion_belief()
+                    finally:
+                        self._lock.release()
+        else:
+            if self._lock.acquire(blocking=False):
+                try:
+                    belief = self._keep_motion_belief()
+                finally:
+                    self._lock.release()
+            else:
+                belief = self._motion_belief
+                if belief is None:  # nothing recorded yet: nothing to fall back on but waiting
+                    with self._lock:
+                        belief = self._keep_motion_belief()
         state = {key: dict(value) if isinstance(value, dict) else value for key, value in belief.items()}
+        if _assembly_enabled():
+            ids = state.pop('_observation_frames', ())
+            skill = decision_views.context(self.executor)[0]
+            state['entities'] = decision_views.Evidence(state['entities'],
+                lambda: self.observation_audit.consume(skill, ids, 'motion_entities_read'))
         state.pop("generation", None)
         state["feedbackSource"] = "estimator"
         try:
@@ -1054,6 +1700,10 @@ class EgoRuntime:
                     and live["episode"] != belief["episode"]) or belief.get("generation") != self._generation:
             return self.arm.virtualize(state)
         live = self._feedback_header(live)
+        if _assembly_enabled():
+            memory = getattr(self, "_memory_checkpoint", None)
+            if memory is not None:
+                memory.note_body(live)
         active_gripper = self.arm.geometry.gripper
         if live.get("stamp") is not None and (active_gripper in (live.get("grippers") or {}) or live.get("gripper")):
             state["feedbackSource"] = "live"
@@ -1065,10 +1715,18 @@ class EgoRuntime:
     def _keep_motion_belief(self) -> dict:
         """Record (and return) the belief part of the motion state; the caller holds ``_lock``."""
         est = self.estimator
-        self._motion_belief = {
-            "generation": self._generation, "episode": self._episode, "stamp": est.stamp, "odometry": dict(est.odometry), "joints": dict(est.joints),
-            "gripper": dict(est.gripper), "grippers": dict(est.grippers), "posed": est.posed,
-            "entities": {t.id: {"p": t.pos.tolist()} for t in est.tracks.values()}}
+        if _assembly_enabled():
+            self._motion_belief = {
+                "generation": self._generation, "episode": self._episode, "stamp": est.stamp, "odometry": dict(est.odometry), "joints": dict(est.joints),
+                "gripper": dict(est.gripper), "grippers": dict(est.grippers), "posed": est.posed,
+                "_observation_frames": tuple(self.observation_audit.latest.values()),
+                "entities": {t.id: {"p": t.pos.tolist(), "category":t.category, "lastSeenAt":t.last_seen}
+                             for t in est.tracks.values()}}
+        else:
+            self._motion_belief = {
+                "generation": self._generation, "episode": self._episode, "stamp": est.stamp, "odometry": dict(est.odometry), "joints": dict(est.joints),
+                "gripper": dict(est.gripper), "grippers": dict(est.grippers), "posed": est.posed,
+                "entities": {t.id: {"p": t.pos.tolist()} for t in est.tracks.values()}}
         return self._motion_belief
 
     def _mark_held(self, track_id: str) -> str:
@@ -1101,27 +1759,76 @@ class EgoRuntime:
                 observed = matches[0] if len(matches) == 1 else "unconfirmed"
                 raise GraspIdentityFailed(f"grasp target mismatch: expected {track_id}, actual track {observed}")
             body = self._feedback_header(body)
-            held = self.estimator.mark_held(track_id, at, gripper=gripper, body=body, identity_verified=verified)
+            options = {"verify_binding": True} if _assembly_enabled() else {}
+            held = self.estimator.mark_held(track_id, at, gripper=gripper, body=body,
+                                            identity_verified=verified, **options)
             track = getattr(self.estimator, 'tracks', {}).get(held)
             if track is not None and track.held_tool_feature is not None:
                 virtual = self.arm.joints_of((body or {}).get('joints', self.estimator.joints),
                                             (body or {}).get('odometry', self.estimator.odometry))
                 track.held_tool_feature['graspWrist'] = {k:virtual.get(k,0.) for k in ('wrist_roll','wrist_pitch')}
+            if _assembly_enabled() and track is not None:
+                from steward.ego.grasp_diagnostics import closed
+                closed(self, track, body)
             return held
 
-    def _released(self, track_id: str, spot: list[float], target: dict | None = None,
-                  tip_roll: float | None = None) -> None:
-        """A place knows where it let go; the belief is told, not left to infer it later -- at the
-        height the hand is at now, not the carry height the last perception update saw."""
-        generation = self._skill_generation()
-        try:
-            body = self.link.sensors()
-        except Exception:  # noqa: BLE001 - the last estimated height is a usable second best
-            body = None
+    if _assembly_enabled():
+        def _released(self, track_id: str, spot: list[float], target: dict | None = None) -> None:
+            """A place knows where it let go; the belief is told, not left to infer it later -- at the
+            height the hand is at now, not the carry height the last perception update saw."""
+            generation = self._skill_generation()
+            try:
+                body = self.link.sensors()
+            except Exception:  # noqa: BLE001 - the last estimated height is a usable second best
+                body = None
+            with self._lock:
+                if not self._same_episode(generation, body):  # the skill or the body is another episode's
+                    return
+                self.estimator.release_at(track_id, spot, body=self._feedback_header(body), target=target)
+                memory = getattr(self, "_memory_checkpoint", None)
+                if memory is not None:
+                    memory.note_body(body)
+                from steward.ego.memory_checkpoint import event
+                event(self, "release_completed")
+    else:
+        def _released(self, track_id: str, spot: list[float], target: dict | None = None,
+                      tip_roll: float | None = None) -> None:
+            """A place knows where it let go; the belief is told, not left to infer it later -- at the
+            height the hand is at now, not the carry height the last perception update saw."""
+            generation = self._skill_generation()
+            try:
+                body = self.link.sensors()
+            except Exception:  # noqa: BLE001 - the last estimated height is a usable second best
+                body = None
+            with self._lock:
+                if not self._same_episode(generation, body):  # the skill or the body is another episode's
+                    return
+                self.estimator.release_at(track_id, spot, body=self._feedback_header(body), target=target, tip_roll=tip_roll)
+
+    def _posterior_look(self, object_id: str, _plan: dict) -> dict:
+        """After a place or tighten, take the look a pick gets and report what the belief now says
+        about the object: its observed height and settled state, and whether the position it stands
+        at is still the release plan's prediction rather than an observation."""
+        self._fresh_look(object_id)  # the raw look, not the pick's throttle: this one is the evidence
         with self._lock:
-            if not self._same_episode(generation, body):  # the skill or the body is another episode's
+            track = self.estimator.tracks.get(object_id)
+            if track is None:
+                return {"observed": False, "note": f"{object_id} is no longer believed"}
+            return {"observed": track.predicted_spot is None, "settled": bool(track.settled),
+                    "existence": round(float(track.existence), 2),
+                    "z": round(float(track.pos[2]), 3),
+                    "p": [round(float(v), 3) for v in track.pos],
+                    "predictedSpot": None if track.predicted_spot is None
+                    else [round(float(v), 3) for v in track.predicted_spot]}
+
+    def _fastened(self, screw_id: str, part_id: str, hole_id: str | None) -> None:
+        """A tighten finished: the screw stops being a separate object and its hole is marked done."""
+        generation = self._skill_generation()
+        with self._lock:
+            if generation != self._generation:  # the skill belongs to another episode's belief
                 return
-            self.estimator.release_at(track_id, spot, body=self._feedback_header(body), target=target, tip_roll=tip_roll)
+            if self.estimator.mark_fastened(screw_id, part_id, hole_id):
+                self._publish_view_scene()
 
     def _skill_generation(self) -> int:
         """The generation the running skill was predicted in: a callback reached after a reset (the
@@ -1201,10 +1908,14 @@ class EgoRuntime:
 
     # ------------------------------------------------------------- Ego API
     def summary(self) -> dict:
+        if _assembly_enabled():
+            from steward.ego import supply_reliability as sr
         es = self.ego_state()
         me = es.entity(SELF_ID)
         p = me.pose.value
-        held = next((r.a["entity"] for r in es.relations if r.type == "attached"), None)
+        holding_by_gripper = {r.b.get("link", "gripper"): r.a["entity"]
+                              for r in es.relations if r.type == "attached"}
+        held = holding_by_gripper.get(self.arm.geometry.gripper, holding_by_gripper.get("gripper"))
         supports = {r.a["entity"]: r.b["entity"] for r in es.relations if r.type == "supported-by"}
         objects = []
         for ent in es.entities:
@@ -1258,23 +1969,48 @@ class EgoRuntime:
             obj["roleConfidence"] = round(confidence, 3)
         job = self.executor.current.to_dict() if self.executor.current else None
         dropped = self.dropped()[-20:]
-        return {
-            "version": es.version,
-            "t": round(es.stamp, 3),
-            "self": {"x": round(p["p"][0], 3), "y": round(p["p"][1], 3),
-                     "yawDeg": round(math.degrees(yaw_from_quat(p["q"])), 1),
-                     "holding": held, "joints": {k: round(v, 3) for k, v in self.arm.joints_of(
-                         {j.id: j.q.value[0] for j in me.rigid.joints if j.q.value},
-                         {"x": p["p"][0], "y": p["p"][1], "yaw": yaw_from_quat(p["q"])}).items()}},
-            "objects": objects,
-            "dropped": dropped,
-            "currentSkill": job,
-            "fault": fault,
-            "perception": self.perception_mode,
-            **({"segmentation": dict(self.segmentation)} if self.perception_mode == "rgbd-segmenter" else {}),
-            "runtimeError": self.last_error,
-            "faceCaptureError": self.face_error,
-        }
+        if _assembly_enabled():
+            from steward.ego.memory_checkpoint import result_fields
+            return public_json({
+                **result_fields(self),
+                "version": es.version,
+                "t": round(es.stamp, 3),
+                "self": {"x": round(p["p"][0], 3), "y": round(p["p"][1], 3),
+                         "yawDeg": round(math.degrees(yaw_from_quat(p["q"])), 1),
+                         "holding": held, "joints": {k: round(v, 3) for k, v in self.arm.joints_of(
+                             {j.id: j.q.value[0] for j in me.rigid.joints if j.q.value},
+                             {"x": p["p"][0], "y": p["p"][1], "yaw": yaw_from_quat(p["q"])}).items()}},
+                "objects": objects,
+                "dropped": dropped,
+                "currentSkill": job,
+                "fault": self.fault_monitor.status(),
+                "perception": self.perception_mode,
+                "observationAccounting": self.observation_audit.snapshot(),
+                **({"segmentation": dict(self.segmentation)} if self.perception_mode == "rgbd-segmenter" else {}),
+                **({"geometryRejections":list(getattr(self.estimator,"geometry_rejections",[])),
+                    "holdingBelief":getattr(self.estimator,"holding_belief",None)}
+                    if sr.holding_enabled() or sr.size_enabled() or sr.role_enabled() else {}),
+                "runtimeError": self.last_error,
+                "faceCaptureError": self.face_error,
+            })
+        else:
+            return {
+                "version": es.version,
+                "t": round(es.stamp, 3),
+                "self": {"x": round(p["p"][0], 3), "y": round(p["p"][1], 3),
+                         "yawDeg": round(math.degrees(yaw_from_quat(p["q"])), 1),
+                         "holding": held, "holdingByGripper": holding_by_gripper, "joints": {k: round(v, 3) for k, v in self.arm.joints_of(
+                             {j.id: j.q.value[0] for j in me.rigid.joints if j.q.value},
+                             {"x": p["p"][0], "y": p["p"][1], "yaw": yaw_from_quat(p["q"])}).items()}},
+                "objects": objects,
+                "dropped": dropped,
+                "currentSkill": job,
+                "fault": self.fault_monitor.status(),
+                "perception": self.perception_mode,
+                **({"segmentation": dict(self.segmentation)} if self.perception_mode == "rgbd-segmenter" else {}),
+                "runtimeError": self.last_error,
+                "faceCaptureError": self.face_error,
+            }
 
     def dropped(self) -> list[dict]:
         """Every recent removal from the Ego-State, oldest first, with its reason."""
@@ -1291,221 +2027,233 @@ class EgoRuntime:
     def _screw_holes_view(affordances) -> list[dict]:
         """Public screw-hole markers: id, body-frame ``p``/``n``, frame/provenance, observation source."""
         out = []
-        for aff in affordances:
-            value = aff.value
-            if not (isinstance(value, dict) and "screw-hole" in value):
-                continue
-            hole = value["screw-hole"]
-            item = {**hole, "id": str(hole["id"]), "p": [round(float(v), 4) for v in hole["p"][:3]],
-                    "source": aff.src or "prior",
-                    "frame": hole.get("frame", "entity" if aff.src == "observed" else "unregistered")}
-            if hole.get("n") is not None:
-                item["n"] = [round(float(v), 4) for v in hole["n"][:3]]
-            out.append(item)
+        if _assembly_enabled():
+            for aff in affordances:
+                value = aff.value
+                if not (isinstance(value, dict) and "screw-hole" in value):
+                    continue
+                hole = value["screw-hole"]
+                out.append({**hole, "id": str(hole["id"]), "p": [round(float(v), 4) for v in hole["p"][:3]],
+                            "source": aff.src or "prior",
+                            "frame": hole.get("frame", "entity" if aff.src == "observed" else "unregistered")})
+        else:
+            for aff in affordances:
+                value = aff.value
+                if not (isinstance(value, dict) and "screw-hole" in value):
+                    continue
+                hole = value["screw-hole"]
+                item = {**hole, "id": str(hole["id"]), "p": [round(float(v), 4) for v in hole["p"][:3]],
+                        "source": aff.src or "prior",
+                        "frame": hole.get("frame", "entity" if aff.src == "observed" else "unregistered")}
+                if hole.get("n") is not None:
+                    item["n"] = [round(float(v), 4) for v in hole["n"][:3]]
+                out.append(item)
         return out
 
-    def screw_holes(self, entity: str) -> dict:
-        """Locate an object's screw holes in the world frame and report which face upward.
+    if not _assembly_enabled():
+        def screw_holes(self, entity: str) -> dict:
+            """Locate an object's screw holes in the world frame and report which face upward.
 
-        Pulls one fresh sensor frame first so tip comes from the detected pose, not from a place
-        ``wristRoll`` claim (arm roll is not body tip). Facing uses the observed tip only
-        (``tipSource=observed``); until then ``holesFaceUp`` is false.
+            Pulls one fresh sensor frame first so tip comes from the detected pose, not from a place
+            ``wristRoll`` claim (arm roll is not body tip). Facing uses the observed tip only
+            (``tipSource=observed``); until then ``holesFaceUp`` is false.
 
-        :param entity: Ego-State object id.
-        :returns: ``{entity, tipRollDeg, tipSource, holesFaceUp, holes:[...]}``.
-        :raises KeyError: unknown object.
-        """
-        from steward.math3d import quat_rotate
+            :param entity: Ego-State object id.
+            :returns: ``{entity, tipRollDeg, tipSource, holesFaceUp, holes:[...]}``.
+            :raises KeyError: unknown object.
+            """
+            from steward.math3d import quat_rotate
 
-        # Refresh belief from the cameras before reading tip / hole facing.
-        try:
-            self._poll_once()
-        except Exception:  # noqa: BLE001 - still answer from the last belief when sensors fail
-            pass
-        es = self.ego_state()
-        ent = es.find(entity)
-        if ent is None:
-            raise KeyError(f"unknown object {entity!r}")
-        with self._lock:
-            track = self.estimator.tracks.get(entity)
-            tip = float(track.tip_roll) if track is not None else 0.0
-            tip_source = track.tip_roll_source if track is not None else "unknown"
-        q = ent.pose.value["q"]
-        origin = ent.pose.value["p"]
-        holes = []
-        for aff in ent.rigid.links[0].affordances:
-            value = aff.value
-            if not (isinstance(value, dict) and "screw-hole" in value):
-                continue
-            hole = value["screw-hole"]
-            body_p = [float(v) for v in hole["p"][:3]]
-            body_n = [float(v) for v in hole["n"][:3]] if hole.get("n") is not None else [0.0, 0.0, 1.0]
-            through = bool(hole.get("through"))
-            world_p = [origin[i] + quat_rotate(q, body_p)[i] for i in range(3)]
-            world_n = quat_rotate(q, body_n)
-            up_dot = float(world_n[2])
-            # Through-holes are insertable from either face when the axis is vertical.
-            if through:
-                facing = "up" if abs(up_dot) > 0.7 else "side"
-            elif up_dot > 0.7:
-                facing = "up"
-            elif up_dot < -0.7:
-                facing = "down"
+            # Refresh belief from the cameras before reading tip / hole facing.
+            try:
+                self._poll_once()
+            except Exception:  # noqa: BLE001 - still answer from the last belief when sensors fail
+                pass
+            es = self.ego_state()
+            ent = es.find(entity)
+            if ent is None:
+                raise KeyError(f"unknown object {entity!r}")
+            with self._lock:
+                track = self.estimator.tracks.get(entity)
+                tip = float(track.tip_roll) if track is not None else 0.0
+                tip_source = track.tip_roll_source if track is not None else "unknown"
+            q = ent.pose.value["q"]
+            origin = ent.pose.value["p"]
+            holes = []
+            for aff in ent.rigid.links[0].affordances:
+                value = aff.value
+                if not (isinstance(value, dict) and "screw-hole" in value):
+                    continue
+                hole = value["screw-hole"]
+                body_p = [float(v) for v in hole["p"][:3]]
+                body_n = [float(v) for v in hole["n"][:3]] if hole.get("n") is not None else [0.0, 0.0, 1.0]
+                through = bool(hole.get("through"))
+                world_p = [origin[i] + quat_rotate(q, body_p)[i] for i in range(3)]
+                world_n = quat_rotate(q, body_n)
+                up_dot = float(world_n[2])
+                # Through-holes are insertable from either face when the axis is vertical.
+                if through:
+                    facing = "up" if abs(up_dot) > 0.7 else "side"
+                elif up_dot > 0.7:
+                    facing = "up"
+                elif up_dot < -0.7:
+                    facing = "down"
+                else:
+                    facing = "side"
+                item = {
+                    "id": str(hole["id"]),
+                    "bodyP": [round(v, 4) for v in body_p],
+                    "worldP": [round(v, 4) for v in world_p],
+                    "worldN": [round(v, 4) for v in world_n],
+                    "upDot": round(up_dot, 3),
+                    "facing": facing,
+                    "source": aff.src or "prior",
+                }
+                if through:
+                    item["through"] = True
+                holes.append(item)
+            observed = tip_source == "observed"
+            any_up = observed and any(h["facing"] == "up" for h in holes)
+            if not holes:
+                hint = None
+            elif not observed:
+                hint = "tip not yet confirmed by camera; wait/observe again before trusting holesFaceUp"
+            elif not any_up:
+                if any(h.get("through") for h in holes):
+                    hint = "through-hole axis not vertical; lay the part flat (either face), then look again"
+                else:
+                    hint = "no screw hole faces up; tip the part onto its side with place roll=±π/2, then look again"
             else:
-                facing = "side"
-            item = {
-                "id": str(hole["id"]),
-                "bodyP": [round(v, 4) for v in body_p],
-                "worldP": [round(v, 4) for v in world_p],
-                "worldN": [round(v, 4) for v in world_n],
-                "upDot": round(up_dot, 3),
-                "facing": facing,
-                "source": aff.src or "prior",
+                hint = None
+            return {
+                "entity": entity,
+                "category": ent.category.value,
+                "tipRollDeg": round(math.degrees(tip), 1),
+                "tipSource": tip_source,
+                "holesFaceUp": any_up,
+                "holes": holes,
+                "hint": hint,
             }
-            if through:
-                item["through"] = True
-            holes.append(item)
-        observed = tip_source == "observed"
-        any_up = observed and any(h["facing"] == "up" for h in holes)
-        if not holes:
-            hint = None
-        elif not observed:
-            hint = "tip not yet confirmed by camera; wait/observe again before trusting holesFaceUp"
-        elif not any_up:
-            if any(h.get("through") for h in holes):
-                hint = "through-hole axis not vertical; lay the part flat (either face), then look again"
-            else:
-                hint = "no screw hole faces up; tip the part onto its side with place roll=±π/2, then look again"
-        else:
-            hint = None
-        return {
-            "entity": entity,
-            "category": ent.category.value,
-            "tipRollDeg": round(math.degrees(tip), 1),
-            "tipSource": tip_source,
-            "holesFaceUp": any_up,
-            "holes": holes,
-            "hint": hint,
-        }
 
-    def _drive_screw_tip_gate(self, target: object) -> str | None:
-        """Refuse drive_screw until the screw's tip is camera-confirmed upright (head up).
+        def _drive_screw_tip_gate(self, target: object) -> str | None:
+            """Refuse drive_screw until the screw's tip is camera-confirmed upright (head up).
 
-        :param target: screw entity id from predict params.
-        :returns: refusal message, or None when the tip is observed upright.
-        """
-        if not isinstance(target, str) or not target:
-            return "drive_screw needs target: id of the seated screw"
-        with self._lock:
-            track = self.estimator.tracks.get(target)
-            if track is None:
-                return f"unknown screw target {target!r}"
-            tip_source = track.tip_roll_source
-            tip = float(track.tip_roll)
-        if tip_source != "observed":
-            return (
-                f"{target} tip not yet confirmed by camera (tipSource={tip_source}); "
-                "ego_observe / ego_screw_holes until tipSource=observed and the screw stands "
-                "tip-down in the hole with head up, then drive_screw again")
-        if abs(tip) > 0.35:
-            return (
-                f"{target} is not upright tip-down (tipRollDeg={math.degrees(tip):.0f}); "
-                "insert_screw_into_hole (or place tip-down) into the hole with head up, then observe again")
-        return None
-
-    def _insert_screw_tip_gate(self, screw_id: object | None = None) -> str | None:
-        """Refuse insert until the held screw's tip end is camera-confirmed.
-
-        Without ``tipSource=observed``, ES treats an unknown tip as upright and skips the stand
-        roll — the screw is then placed sideways / head-down. Observe after pick first.
-
-        :param screw_id: optional expected screw id (defaults to the held track).
-        :returns: refusal message, or None when the held screw tip is observed.
-        """
-        with self._lock:
-            held_id = self.estimator.held_id
-            if not held_id:
-                return "insert_screw_into_hole needs a toy_screw in the gripper"
-            track = self.estimator.tracks.get(held_id)
-            if track is None:
-                return f"unknown held screw {held_id!r}"
-            if track.category != "toy_screw":
+            :param target: screw entity id from predict params.
+            :returns: refusal message, or None when the tip is observed upright.
+            """
+            if not isinstance(target, str) or not target:
+                return "drive_screw needs target: id of the seated screw"
+            with self._lock:
+                track = self.estimator.tracks.get(target)
+                if track is None:
+                    return f"unknown screw target {target!r}"
+                tip_source = track.tip_roll_source
+                tip = float(track.tip_roll)
+            if tip_source != "observed":
                 return (
-                    f"insert_screw_into_hole needs a toy_screw in the gripper, got {held_id} "
-                    f"({track.category})")
-            if isinstance(screw_id, str) and screw_id and screw_id != held_id:
-                return f"gripper holds {held_id}, not {screw_id}"
-            tip_source = track.tip_roll_source
-        if tip_source != "observed":
-            return (
-                f"{held_id} tip not yet confirmed by camera (tipSource={tip_source}); "
-                "after pick, ego_observe / ego_screw_holes until tipSource=observed so the skill "
-                "knows which end is the tip and can stand it tip-down into the hole")
-        return None
-
-    def _verify_screw_seat(self, screw_id: str) -> tuple[bool, str]:
-        """After an insert place: poll cameras and confirm the screw stands tip-down in a hole.
-
-        :param screw_id: released screw track id.
-        :returns: ``(ok, message)`` — ok when seated head-up in a hole; message explains a miss.
-        """
-        try:
-            self._poll_once()
-        except Exception:  # noqa: BLE001 - verify from last belief when sensors fail
-            pass
-        es = self.ego_state()
-        target = es.find(screw_id)
-        if target is None:
-            return False, f"unknown screw {screw_id!r} after place"
-        with self._lock:
-            track = self.estimator.tracks.get(screw_id)
-            tip_source = track.tip_roll_source if track is not None else "unknown"
-            tip = float(track.tip_roll) if track is not None else 0.0
-        try:
-            _mate, issues = self.esim._ensure_screw_seated_for_drive(es, target)
-        except PredictionError as exc:
-            return False, str(exc)
-        if tip_source == "observed" and abs(tip) > 0.35:
-            return False, (
-                f"{screw_id} tipped over after place (tipRollDeg={math.degrees(tip):.0f}); "
-                "re-pick and insert tip-down again")
-        return True, issues[0] if issues else f"{screw_id} seated tip-down in hole"
-
-    def _replan_pick(self, screw_id: str) -> dict | None:
-        """Fresh pick plan for a screw that missed its hole (insert retry).
-
-        :param screw_id: screw to grasp again.
-        :returns: pick plan dict, or None when pick is infeasible.
-        """
-        receipt = self.esim.predict(self.ego_state(), "pick", {"target": screw_id})
-        if not receipt.get("feasible"):
+                    f"{target} tip not yet confirmed by camera (tipSource={tip_source}); "
+                    "ego_observe / ego_screw_holes until tipSource=observed and the screw stands "
+                    "tip-down in the hole with head up, then drive_screw again")
+            if abs(tip) > 0.35:
+                return (
+                    f"{target} is not upright tip-down (tipRollDeg={math.degrees(tip):.0f}); "
+                    "insert_screw_into_hole (or place tip-down) into the hole with head up, then observe again")
             return None
-        return receipt.get("plan") or None
 
-    def _replan_insert_place(self, insert: dict) -> dict | None:
-        """Fresh tip-down insert place after re-picking a missed screw.
+        def _insert_screw_tip_gate(self, screw_id: object | None = None, gripper: str | None = None) -> str | None:
+            """Refuse insert until the held screw's tip end is camera-confirmed.
 
-        Polls cameras and requires ``tipSource=observed`` on the held screw so the stand roll
-        knows which end is the tip.
+            Without ``tipSource=observed``, ES treats an unknown tip as upright and skips the stand
+            roll — the screw is then placed sideways / head-down. Observe after pick first.
 
-        :param insert: ``insertParams`` from the original plan (``object``, ``on``, optional ``hole``).
-        :returns: insert plan dict, or None when insert predict is infeasible.
-        """
-        try:
-            self._poll_once()
-        except Exception:  # noqa: BLE001 - replan from last belief when sensors fail
-            pass
-        if self._insert_screw_tip_gate(insert.get("object")) is not None:
+            :param screw_id: optional expected screw id (defaults to the held track).
+            :returns: refusal message, or None when the held screw tip is observed.
+            """
+            with self._lock:
+                load = self.estimator.holding_for(None if gripper == "gripper" else gripper) if gripper else None
+                held_id = load.id if load else (self.estimator.held_id if gripper is None else None)
+                if not held_id:
+                    return "insert_screw_into_hole needs a toy_screw in the gripper"
+                track = self.estimator.tracks.get(held_id)
+                if track is None:
+                    return f"unknown held screw {held_id!r}"
+                if track.category != "toy_screw":
+                    return (
+                        f"insert_screw_into_hole needs a toy_screw in the gripper, got {held_id} "
+                        f"({track.category})")
+                if isinstance(screw_id, str) and screw_id and screw_id != held_id:
+                    return f"gripper holds {held_id}, not {screw_id}"
+                tip_source = track.tip_roll_source
+            if tip_source != "observed":
+                return (
+                    f"{held_id} tip not yet confirmed by camera (tipSource={tip_source}); "
+                    "after pick, ego_observe / ego_screw_holes until tipSource=observed so the skill "
+                    "knows which end is the tip and can stand it tip-down into the hole")
             return None
-        params: dict = {"on": insert.get("on")}
-        if insert.get("hole") is not None:
-            params["hole"] = insert["hole"]
-        if insert.get("maxAttempts") is not None:
-            params["maxAttempts"] = insert["maxAttempts"]
-        receipt = self.esim.predict(self.ego_state(), "insert_screw_into_hole", params)
-        if not receipt.get("feasible"):
-            return None
-        return receipt.get("plan") or None
+
+        def _verify_screw_seat(self, screw_id: str) -> tuple[bool, str]:
+            """After an insert place: poll cameras and confirm the screw stands tip-down in a hole.
+
+            :param screw_id: released screw track id.
+            :returns: ``(ok, message)`` — ok when seated head-up in a hole; message explains a miss.
+            """
+            try:
+                self._poll_once()
+            except Exception:  # noqa: BLE001 - verify from last belief when sensors fail
+                pass
+            es = self.ego_state()
+            target = es.find(screw_id)
+            if target is None:
+                return False, f"unknown screw {screw_id!r} after place"
+            with self._lock:
+                track = self.estimator.tracks.get(screw_id)
+                tip_source = track.tip_roll_source if track is not None else "unknown"
+                tip = float(track.tip_roll) if track is not None else 0.0
+            try:
+                _mate, issues = self.esim._ensure_screw_seated_for_drive(es, target)
+            except PredictionError as exc:
+                return False, str(exc)
+            if tip_source == "observed" and abs(tip) > 0.35:
+                return False, (
+                    f"{screw_id} tipped over after place (tipRollDeg={math.degrees(tip):.0f}); "
+                    "re-pick and insert tip-down again")
+            return True, issues[0] if issues else f"{screw_id} seated tip-down in hole"
+
+        def _replan_pick(self, screw_id: str) -> dict | None:
+            """Fresh pick plan for a screw that missed its hole (insert retry).
+
+            :param screw_id: screw to grasp again.
+            :returns: pick plan dict, or None when pick is infeasible.
+            """
+            receipt = self.esim.predict(self.ego_state(), "pick", {"target": screw_id})
+            if not receipt.get("feasible"):
+                return None
+            return receipt.get("plan") or None
+
+        def _replan_insert_place(self, insert: dict) -> dict | None:
+            """Fresh tip-down insert place after re-picking a missed screw.
+
+            Polls cameras and requires ``tipSource=observed`` on the held screw so the stand roll
+            knows which end is the tip.
+
+            :param insert: ``insertParams`` from the original plan (``object``, ``on``, optional ``hole``).
+            :returns: insert plan dict, or None when insert predict is infeasible.
+            """
+            try:
+                self._poll_once()
+            except Exception:  # noqa: BLE001 - replan from last belief when sensors fail
+                pass
+            if self._insert_screw_tip_gate(insert.get("object")) is not None:
+                return None
+            params: dict = {"on": insert.get("on")}
+            if insert.get("hole") is not None:
+                params["hole"] = insert["hole"]
+            if insert.get("maxAttempts") is not None:
+                params["maxAttempts"] = insert["maxAttempts"]
+            receipt = self.esim.predict(self.ego_state(), "insert_screw_into_hole", params)
+            if not receipt.get("feasible"):
+                return None
+            return receipt.get("plan") or None
 
     def _unsupported(self, track_id: str) -> bool:
         """Whether the object floats where it is believed to be (:meth:`EgoEstimator.unsupported`)."""
@@ -1850,89 +2598,276 @@ class EgoRuntime:
         return {"reference": reference, "referenceCoverage": round(float(np.isfinite(ref_rgb[..., 0]).mean()), 2),
                 "results": results, "stamp": snapshot.stamp}
 
-    def observe(self) -> dict:
-        frame = self.link.sensors()
-        cameras = self._cameras(frame)
-        if frame.get("imaging") == "rgbd":
-            visible = []
-            for camera in cameras:
-                whole = decode_rgbd(self.link.rgbd(camera))
-                rgbd = decimated(whole, self._perception_rows(whole), self.config.depth_join)
-                if rgbd["mask"] is None and not self._segment([(rgbd, whole)]):
-                    raise RuntimeError(f"the {camera} image could not be segmented: {self.segmentation['lastError']}")
-                rgbd = self._feedback_frame(rgbd)
-                with self._lock:
-                    cam = self.estimator.camera_pose(rgbd["header"]["odometry"], camera)
-                for seg in segments(rgbd, cam):
-                    centre, size, _ = box_of(seg.points)
-                    probs = self.estimator.category_probs(size, centre[2] - size[2] / 2, seg.color, seg.invalid_frac,
-                                                          True, seg.semantics)
-                    best = max(probs, key=probs.get)
-                    visible.append({"category": best, "confidence": round(probs[best], 2), "rangeM": round(seg.range, 2),
-                                    "camera": camera})
-        else:
-            visible = []
-            for d in frame["detections"]:
-                if d.get("camera") not in cameras:
+    if _assembly_enabled():
+        def prerelease_snapshots(self, *, cached=False) -> dict:
+            """Raw sensor PNGs only; no segmentation, observation wait or model image payload."""
+            result = dict(files={}, errors={})
+            if self.out_dir is None:
+                result['errors']['directory'] = 'runtime_output_directory_unavailable'
+                return result
+            # Evidence snapshots retain the periodic rig; optional wrist capture is scoped to assembly.
+            for camera, (_, sensor) in self.estimator.cameras.items():
+                if sensor.get('onDemand'):
                     continue
-                item = {"category": d["category"], "rangeM": round(d["range"], 2), "camera": d.get("camera")}
-                if d.get("screwHoles"):
-                    item["screwHoles"] = [{"id": h["id"], "p": list(h["p"])} for h in d["screwHoles"]]
-                visible.append(item)
-        out = {"t": frame["stamp"], "visible": visible}
-        if self.out_dir is not None:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-            out["imagePaths"] = {}
-            for camera in cameras:
-                path = self.out_dir / f"observe-{frame['stamp']:.2f}-{camera}.png"
-                path.write_bytes(self.link.camera_png(camera=camera))
-                out["imagePaths"][camera] = str(path)
-        return out
+                try:
+                    raw = (getattr(self, '_latest_native_frames', {}).get(camera) if cached
+                           else decode_rgbd(self.link.rgbd(camera, timeout=2.)))
+                    if raw is None:
+                        result['errors'][camera] = 'no_cached_native_frame'
+                        continue
+                    self.out_dir.mkdir(parents=True, exist_ok=True)
+                    stamp = raw['header']['stamp']
+                    path = self.out_dir / f"prerelease-{stamp:.6f}-{camera}.png"
+                    Image.fromarray(raw['rgb']).save(path, format='PNG')
+                    result['files'][camera] = dict(filename=path.name, stamp=stamp,
+                        width=int(raw['rgb'].shape[1]), height=int(raw['rgb'].shape[0]),
+                        cached=cached, ageS=float(self.estimator.stamp-stamp))
+                except Exception as exc:
+                    result['errors'][camera] = type(exc).__name__
+            return result
 
-    def predict(self, skill: str, params: dict) -> dict:
-        if skill in ("drive_screw", "insert_screw_into_hole"):
-            # Refresh cameras before trusting screw tip / head-up (same as ego_screw_holes).
-            try:
-                self._poll_once()
-            except Exception:  # noqa: BLE001 - still predict from the last belief when sensors fail
-                pass
-        es = self.ego_state()
-        if skill == "close":
-            # The drawer the robot pulled open is closed by that pull (handle, axis, distance)
-            # unless the caller names another: views of the open drawer box it deeper than it is.
-            params = {**self.executor.pull_of(str(params.get("target", ""))), **params}
-        if skill == "drive_screw":
-            gate = self._drive_screw_tip_gate(params.get("target"))
-            if gate is not None:
-                receipt = self.esim._receipt(
-                    es, "drive_screw", params, 1.0, [gate], {}, feasible=False)
-                limit = self.config.max_risk
-                receipt["withinRiskLimit"] = False
-                receipt["maxRisk"] = limit
-                with self._lock:
-                    self.receipts[receipt["id"]] = receipt
-                    self._receipt_generation[receipt["id"]] = self._generation
-                return receipt
-        if skill == "insert_screw_into_hole":
-            gate = self._insert_screw_tip_gate(params.get("object") or params.get("target"))
-            if gate is not None:
-                receipt = self.esim._receipt(
-                    es, "insert_screw_into_hole", params, 1.0, [gate], {}, feasible=False)
-                limit = self.config.max_risk
-                receipt["withinRiskLimit"] = False
-                receipt["maxRisk"] = limit
-                with self._lock:
-                    self.receipts[receipt["id"]] = receipt
-                    self._receipt_generation[receipt["id"]] = self._generation
-                return receipt
-        receipt = self.esim.predict(es, skill, params)
-        limit = self.config.max_pick_risk if receipt.get("skill") == "pick" else self.config.max_risk
-        receipt["withinRiskLimit"] = receipt["feasible"] and receipt["risk"] <= limit
-        receipt["maxRisk"] = limit
+    def observe(self) -> dict:
+        if _assembly_enabled():
+            with self._observation_io:
+                old = getattr(self, '_observation_reason', 'periodic'), getattr(self, '_observation_skill', None)
+                self._observation_reason, self._observation_skill = 'explicit_observe', 'observe'
+                try:
+                    with self._holding('input'):
+                        return self._observe_visible()
+                finally:
+                    self._observation_reason, self._observation_skill = old
+        else:
+            frame = self.link.sensors()
+            cameras = self._cameras(frame)
+            if frame.get("imaging") == "rgbd":
+                visible = []
+                for camera in cameras:
+                    whole = decode_rgbd(self.link.rgbd(camera))
+                    rgbd = decimated(whole, self._perception_rows(whole), self.config.depth_join)
+                    if rgbd["mask"] is None and not self._segment([(rgbd, whole)]):
+                        raise RuntimeError(f"the {camera} image could not be segmented: {self.segmentation['lastError']}")
+                    rgbd = self._feedback_frame(rgbd)
+                    with self._lock:
+                        cam = self.estimator.camera_pose(rgbd["header"]["odometry"], camera)
+                    for seg in segments(rgbd, cam):
+                        centre, size, _ = box_of(seg.points)
+                        probs = self.estimator.category_probs(size, centre[2] - size[2] / 2, seg.color, seg.invalid_frac,
+                                                              True, seg.semantics)
+                        best = max(probs, key=probs.get)
+                        visible.append({"category": best, "confidence": round(probs[best], 2), "rangeM": round(seg.range, 2),
+                                        "camera": camera})
+            else:
+                visible = []
+                for d in frame["detections"]:
+                    if d.get("camera") not in cameras:
+                        continue
+                    item = {"category": d["category"], "rangeM": round(d["range"], 2), "camera": d.get("camera")}
+                    if d.get("screwHoles"):
+                        item["screwHoles"] = [{"id": h["id"], "p": list(h["p"])} for h in d["screwHoles"]]
+                    visible.append(item)
+            out = {"t": frame["stamp"], "visible": visible}
+            if self.out_dir is not None:
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                out["imagePaths"] = {}
+                for camera in cameras:
+                    path = self.out_dir / f"observe-{frame['stamp']:.2f}-{camera}.png"
+                    path.write_bytes(self.link.camera_png(camera=camera))
+                    out["imagePaths"][camera] = str(path)
+            return out
+
+    def _planner_for(self, params: dict) -> Esim:
+        """Resolve an explicit arm or retain the working arm; unsupported selections fail."""
+        if "arm" not in params:
+            return self.esim
+        side = params["arm"]
+        if not isinstance(side, str) or side not in self._arm_esims:
+            raise ValueError("arm must be L or R on a dual-arm body; omit arm on a single-arm body")
+        return self._arm_esims[side]
+
+    def _arm_load_issue(self, planner: Esim) -> str | None:
+        """Drawer-handle following is shared; object loads belong to individual hands."""
+        gripper = planner.arm.geometry.gripper
         with self._lock:
-            self.receipts[receipt["id"]] = receipt
-            self._receipt_generation[receipt["id"]] = self._generation
-        return receipt
+            other = next((g for g, report in self.estimator.grippers.items()
+                          if g != gripper and report.get("holdingHandle")), None)
+        if other is not None:
+            return f"{other} holds a drawer handle; release it before selecting {gripper}"
+        return None
+
+    if _assembly_enabled():
+        def _observe_visible(self) -> dict:
+            frame = self.link.sensors()
+            cameras = self._cameras(frame)
+            if frame.get("imaging") == "rgbd":
+                visible = []
+                if decision_views.enabled(self) and getattr(self, '_running', False):
+                    # Explicit observation is a decision too. Reuse/fuse its one
+                    # batch so the immediately following prediction needs no second
+                    # segmentation of identical pixels.
+                    self._poll_once(decision='explicit_observe')
+                    pairs = [(self._latest_segmented_frames[c], self._latest_native_frames[c])
+                             for c in cameras if self._fused_stamps.get(c) == frame['stamp']]
+                    if len(pairs) != len(cameras):
+                        raise RuntimeError(f"images could not be segmented: {self.segmentation['lastError']}")
+                else:
+                    whole = [decode_rgbd(self.link.rgbd(camera)) for camera in cameras]
+                    pairs = [(decimated(raw, self._perception_rows(raw), self.config.depth_join), raw) for raw in whole]
+                    unmasked = [pair for pair in pairs if pair[0]['mask'] is None]
+                    batches = [unmasked] if decision_views.enabled(self) else [[pair] for pair in unmasked]
+                    for batch in batches:
+                        if batch and not self._segment(batch):
+                            raise RuntimeError(f"images could not be segmented: {self.segmentation['lastError']}")
+                for rgbd, full in pairs:
+                    camera = rgbd['camera']
+                    identity = self.observation_audit.processed(rgbd, **self._observation_context())
+                    with self._lock:
+                        cam = self.estimator.camera_pose(rgbd["header"]["odometry"], camera)
+                    for seg in segments(rgbd, cam):
+                        centre, size, _ = box_of(seg.points)
+                        probs = self.estimator.category_probs(size, centre[2] - size[2] / 2, seg.color, seg.invalid_frac,
+                                                              True, seg.semantics)
+                        best = max(probs, key=probs.get)
+                        visible.append({"category": best, "confidence": round(probs[best], 2), "rangeM": round(seg.range, 2),
+                                        "camera": camera})
+                    self.observation_audit.consume('observe', [identity], 'visible_objects_read')
+                self._remember_decision_frames(pairs)
+            else:
+                visible = []
+                for d in frame["detections"]:
+                    if d.get("camera") not in cameras:
+                        continue
+                    item = {"category": d["category"], "rangeM": round(d["range"], 2), "camera": d.get("camera")}
+                    if d.get("screwHoles"):
+                        item["screwHoles"] = [{"id": h["id"], "p": list(h["p"])} for h in d["screwHoles"]]
+                    visible.append(item)
+            out = {"t": frame["stamp"], "visible": visible}
+            if self.out_dir is not None:
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                out["imagePaths"] = {}
+                for camera in cameras:
+                    path = self.out_dir / f"observe-{frame['stamp']:.2f}-{camera}.png"
+                    path.write_bytes(self.link.camera_png(camera=camera))
+                    out["imagePaths"][camera] = str(path)
+            return out
+
+    if _assembly_enabled():
+        @timed("prediction")
+        def predict(self, skill: str, params: dict) -> dict:
+            self._observe_decision('prediction', skill)
+            self.observation_audit.consume(skill, reason='prediction')
+            params = {k:v for k,v in params.items() if k != 'preconditionContext'}
+            es = self.ego_state()
+            from steward.ego import placement_support_margin
+            protected = placement_support_margin.guard(self.estimator.stationary_assemblies.records, skill, params)
+            if skill == "close":
+                # The drawer the robot pulled open is closed by that pull (handle, axis, distance)
+                # unless the caller names another: views of the open drawer box it deeper than it is.
+                params = {**self.executor.pull_of(str(params.get("target", ""))), **params}
+            from steward.ego.preconditions import evaluate, blocked, SKILLS
+            checks = evaluate(self, skill, params)
+            reasons = blocked(checks)
+            from steward.ego import session_inventory
+            ownership = session_inventory.guard(self, skill, params)
+            if ownership:
+                reasons = [*reasons, ownership['message']]
+            if protected and skill != 'flip_assembly':
+                reasons = [protected['guidance']]
+            receipt = (self.esim._receipt(es, skill, params, 0., reasons, {}, feasible=False)
+                       if reasons else self._predict_assembly_session(es, params) if skill == 'complete_assembly'
+                       else self.esim.predict(es, skill, params))
+            if any(issue.startswith("unknown skill ") for issue in receipt['issues']):
+                from steward.ego.skill_catalog import PUBLIC_SKILLS
+                receipt['issues'] = [f"unknown skill {skill!r}; known: {', '.join(PUBLIC_SKILLS)}"]
+            if skill in SKILLS:
+                checks = evaluate(self, skill, params, receipt.get('plan')) if not reasons else checks
+                reasons = blocked(checks)
+                receipt['preconditions'] = checks
+                if reasons:
+                    receipt['feasible'] = False
+                    receipt['issues'] = list(dict.fromkeys([*reasons, *receipt['issues']]))
+                context_params = {k:params[k] for k in ('part', 'body', 'on', 'hole', 'heldHole',
+                                  'seatBody', 'seatHole', 'operation') if k in params}
+                receipt['plan']['preconditionContext'] = dict(skill=skill, params=context_params, receipt=receipt['id'])
+            from steward.ego.mating_face import admit
+            receipt = admit(self, es, skill, params, receipt)
+            from steward.ego.procedure_advice import apply as procedure_advice
+            receipt = procedure_advice(self.esim, es, skill, params, receipt)
+            if ownership:
+                receipt.update(feasible=False, resumeSession=ownership['session'],
+                               sessionProtection=ownership)
+            if protected and skill != 'flip_assembly':
+                receipt.update(protected, feasible=False)
+            limit = self.config.max_pick_risk if receipt.get("skill") == "pick" else self.config.max_risk
+            receipt["withinRiskLimit"] = receipt["feasible"] and receipt["risk"] <= limit
+            receipt["maxRisk"] = limit
+            if getattr(self, '_configuration_pending', False):
+                receipt['capabilityConfiguration'] = deepcopy(self.capability_configuration)
+                self._configuration_pending = False
+            from steward.ego.memory_checkpoint import result_fields
+            receipt.update(result_fields(self))
+            with self._lock:
+                self.receipts[receipt["id"]] = receipt
+                self._receipt_generation[receipt["id"]] = self._generation
+            from steward.ego.assembly_session import current
+            if current() is not None:
+                current().emit('primitive_predict', skill=skill, receipt=deepcopy(receipt))
+            return receipt
+    else:
+        def predict(self, skill: str, params: dict) -> dict:
+            planner = self._planner_for(params)
+            if isinstance(planner.arm, PiperArm):
+                params = {**params, "arm": planner.arm.config.arm}
+            if skill in ("drive_screw", "insert_screw_into_hole"):
+                # Refresh cameras before trusting screw tip / head-up (same as ego_screw_holes).
+                try:
+                    self._poll_once()
+                except Exception:  # noqa: BLE001 - still predict from the last belief when sensors fail
+                    pass
+            es = self.ego_state()
+            issue = self._arm_load_issue(planner)
+            if issue is not None:
+                receipt = planner._receipt(es, skill, params, 1.0, [issue], {}, feasible=False)
+                receipt.update(withinRiskLimit=False, maxRisk=self.config.max_risk)
+                with self._lock:
+                    self.receipts[receipt["id"]] = receipt
+                    self._receipt_generation[receipt["id"]] = self._generation
+                return receipt
+            if skill == "close":
+                # The drawer the robot pulled open is closed by that pull (handle, axis, distance)
+                # unless the caller names another: views of the open drawer box it deeper than it is.
+                params = {**self.executor.pull_of(str(params.get("target", ""))), **params}
+            if skill == "drive_screw":
+                gate = self._drive_screw_tip_gate(params.get("target"))
+                if gate is not None:
+                    receipt = planner._receipt(
+                        es, "drive_screw", params, 1.0, [gate], {}, feasible=False)
+                    limit = self.config.max_risk
+                    receipt["withinRiskLimit"] = False
+                    receipt["maxRisk"] = limit
+                    with self._lock:
+                        self.receipts[receipt["id"]] = receipt
+                        self._receipt_generation[receipt["id"]] = self._generation
+                    return receipt
+            if skill == "insert_screw_into_hole":
+                gate = self._insert_screw_tip_gate(params.get("object") or params.get("target"), planner.arm.geometry.gripper)
+                if gate is not None:
+                    receipt = planner._receipt(
+                        es, "insert_screw_into_hole", params, 1.0, [gate], {}, feasible=False)
+                    limit = self.config.max_risk
+                    receipt["withinRiskLimit"] = False
+                    receipt["maxRisk"] = limit
+                    with self._lock:
+                        self.receipts[receipt["id"]] = receipt
+                        self._receipt_generation[receipt["id"]] = self._generation
+                    return receipt
+            receipt = planner.predict(es, skill, params)
+            limit = self.config.max_pick_risk if receipt.get("skill") == "pick" else self.config.max_risk
+            receipt["withinRiskLimit"] = receipt["feasible"] and receipt["risk"] <= limit
+            receipt["maxRisk"] = limit
+            with self._lock:
+                self.receipts[receipt["id"]] = receipt
+                self._receipt_generation[receipt["id"]] = self._generation
+            return receipt
 
     def annotate(self, request: dict) -> dict:
         """Name an Ego-State object as the robot's agent identified it (``label``, ``affordances``).
@@ -1953,6 +2888,48 @@ class EgoRuntime:
             self.estimator.annotate(entity, label, affordances)
             self._publish_view_scene()
         return next(o for o in self.summary()["objects"] if o["id"] == entity)
+
+    def stage_protect(self, request: dict) -> dict:
+        """Protect a mission-staged spot from furniture false-positive drops.
+
+        Chores parks drawer items on a sideboard top; without an anchor the pistol heuristic
+        drops anything there taller than the drawer band. The anchor is XY-based so a renumbered
+        track at the same spot stays protected without freezing fusion (unlike ``pinned``).
+        ``clear: true`` removes an anchor.
+
+        :param request: ``{xy, role?, radius?, clear?}``. ``xy`` is world XY; with ``clear`` it
+            selects which anchor to remove (omit ``xy`` to clear all). Optional ``pin``+``entity``
+            pins a live track for a short window (fusion freezes while pinned).
+        :returns: ``{anchors, cleared?, pinned?}``.
+        """
+        clear = bool(request.get("clear"))
+        xy = request.get("xy")
+        with self._lock:
+            if clear:
+                cleared = self.estimator.clear_stage_spot(xy if isinstance(xy, (list, tuple)) else None)
+                return {"anchors": list(self.estimator._stage_protect), "cleared": cleared}
+            if not isinstance(xy, (list, tuple)) or len(xy) < 2:
+                raise ValueError("stage-protect needs xy=[x, y]")
+            role = request.get("role")
+            if role is not None and (not isinstance(role, str) or not role.strip()):
+                raise ValueError("role must be a non-empty string")
+            radius = request.get("radius")
+            if radius is None:
+                anchor = self.estimator.protect_stage_spot(xy, role=role)
+            else:
+                anchor = self.estimator.protect_stage_spot(xy, role=role, radius=float(radius))
+            pinned = False
+            entity = request.get("entity")
+            if request.get("pin") and isinstance(entity, str):
+                track = self.estimator.tracks.get(entity)
+                if track is not None:
+                    if not track.pinned:
+                        track.pin_observed_age = max(0., self.estimator.stamp - track.last_seen)
+                    track.pinned = True
+                    if role:
+                        track.label = role
+                    pinned = True
+            return {"anchors": list(self.estimator._stage_protect), "anchor": anchor, "pinned": pinned}
 
     def forget(self, request: dict) -> dict:
         """Remove an Ego-State object the robot's agent judged a false perception: implausible where
@@ -2473,6 +3450,12 @@ class EgoRuntime:
         the plan here, a large one invalidates it — the mission re-plans from the corrected
         belief instead of the robot driving to a pose that belongs to an object that is no
         longer there."""
+        if _assembly_enabled():
+            from steward.ego import placement_support_margin
+            protected = placement_support_margin.guard(self.estimator.stationary_assemblies.records, skill, receipt.get('params', receipt.get('plan', {})))
+            if protected and skill != 'flip_assembly':
+                raise SkillFailed(protected['guidance'])
+            self._check_skill_preconditions(receipt.get('plan', {}), phase='begin')
         plan = (receipt.get("plan") or {}) if skill == "pick" else {}
         if plan.get('assemblyGrip'):
             return  # commanded release/frozen body frame; inspect after the grasp
@@ -2504,6 +3487,9 @@ class EgoRuntime:
               file=sys.stderr, flush=True)
 
     def _skill_finished(self, job: Job) -> None:
+        if _assembly_enabled():
+            from steward.ego.preconditions import publish
+            publish(job)
         with self._lock:
             if job.episode_generation == self._generation and job.finished is not None:
                 receipt = self.receipts.get(job.receipt, {})
@@ -2528,6 +3514,10 @@ class EgoRuntime:
                     self._log("state", f"DEGRADED：检测到重复操作 {action['operation']} {target or ''}".rstrip())
         result = {"succeeded": "完成", "failed": "失败", "stopped": "被停止"}.get(job.state, job.state)
         self._log("skill", f"{job.skill} {result}" + (f"：{job.message}" if job.state != "succeeded" else ""))
+        if _assembly_enabled():
+            memory = getattr(self, "_memory_checkpoint", None)
+            if memory is not None:
+                memory.skill_finished(job)
 
     def activity_since(self, since: int = 0) -> list[dict]:
         """Activity entries with an id above ``since``, oldest first.
@@ -2550,11 +3540,18 @@ class EgoRuntime:
         if not isinstance(steps, list) or not all(isinstance(st, dict) and isinstance(st.get("name"), str)
                                                    and st.get("status") in PLAN_STEP_STATES for st in steps):
             raise ValueError(f"plan steps need a name and a status in {sorted(PLAN_STEP_STATES)}")
+        if _assembly_enabled():
+            requirements = plan.get('assemblyRequirements', [])
+            if not isinstance(requirements, list) or not all(isinstance(r, dict) and all(
+                    isinstance(r.get(k), str) and r[k] for k in ('part', 'body', 'hole')) for r in requirements):
+                raise ValueError('assemblyRequirements needs part, body and hole interface selector strings')
         record = {"goal": goal[:300], "source": str(plan.get("source", "agent"))[:60],
                   "steps": [{"name": st["name"][:200], "status": st["status"]} for st in steps[:30]],
                   "round": plan.get("round"), "current": str(plan.get("current") or "")[:400],
                   "difficulty": str(plan.get("difficulty") or "")[:600], "state": str(plan.get("state") or "running")[:40],
                   "t": round(self.estimator.stamp, 2)}
+        if _assembly_enabled():
+            record['assemblyRequirements'] = [{k:r[k] for k in ('part', 'body', 'hole')} for r in requirements]
         with self._lock:
             previous, self.plan = self.plan or {}, record
         if record["current"] and record["current"] != previous.get("current"):
@@ -2620,20 +3617,27 @@ class EgoRuntime:
         return self._fresh_look(target_id)
 
     def _fresh_look(self, target_id: str) -> bool:
-        """Re-place the pick's target from a class-prompted segmentation taken right now.
+        """Re-place the pick's target from a segmentation taken right now.
 
         An accumulated position can be biased by the partial views it was fused from — a rim arc
         read as confidently as the bowl itself. The action deserves the best single look there is,
-        and this is it: the robot stands beside the object and the camera points at it. The class
-        name is the robot's own prior (another name for the same thing is tried too, because a mug
-        is a cup to half the world); the believed position only decides which returned instance is
-        the one meant. The track keeps its identity; only where it stands is restated."""
+        and this is it: the robot stands beside the object and the camera points at it. With a
+        robot-side segmenter the class name is the robot's own prior (another name for the same
+        thing is tried too, because a mug is a cup to half the world); without one the frame's own
+        anonymous instance masks are the segmentation. The believed position only decides which
+        returned instance is the one meant. The track keeps its identity; only where it stands is
+        restated."""
         url = os.environ.get("STEWARD_SEGMENTER_URL")
         track = self.estimator.tracks.get(target_id)
-        if url is None or track is None or not body_ok(track.category):
-            print(f"ego: fresh look for {target_id} skipped (url={'set' if url else 'unset'}, "
-                  f"track={'known' if track else 'unknown'})", file=sys.stderr, flush=True)
+        if track is None or not body_ok(track.category):
+            print(f"ego: fresh look for {target_id} skipped (track={'known' if track else 'unknown'})",
+                  file=sys.stderr, flush=True)
             return False
+        if url is None:
+            # No robot-side segmenter: the world's own frame geometry (anonymous masks in phase1,
+            # the detector's noisy boxes in phase0) is the segmentation channel, read from the
+            # perception loop's latest frame.
+            return self._fresh_look_latest(target_id, track)
         try:
             frame = decode_rgbd(self.link.rgbd())
             cam = self.estimator.camera_pose()
@@ -2734,17 +3738,114 @@ class EgoRuntime:
             print(f"ego: fresh look for {target_id} failed: {exc}", file=sys.stderr, flush=True)
             return False
 
+    if _assembly_enabled():
+        def _check_skill_preconditions(self, plan, *, phase='release'):
+            context = plan.get('preconditionContext')
+            if not context:
+                return
+            from steward.ego.preconditions import evaluate, blocked, record_job
+            checks = evaluate(self, context['skill'], context['params'], plan)
+            receipt = self.receipts.get(context['receipt'])
+            if receipt is not None:
+                receipt['preconditions'] = checks
+            job = self.executor.current
+            if job is not None:
+                record_job(job, checks, context['receipt']+':'+phase)
+            reasons = blocked(checks)
+            if reasons:
+                if receipt is not None:
+                    receipt.update(feasible=False, withinRiskLimit=False,
+                        issues=list(dict.fromkeys([*reasons, *receipt.get('issues', [])])))
+                raise SkillFailed('; '.join(reasons))
+
+        def _prepare_place_surface(self, job, plan):
+            from steward.ego.assemble import AssembleOnto
+            from steward.ego.place_surface import refresh
+            context = plan.get('preconditionContext', {})
+            receipt = self.receipts.get(context.get('receipt'), {})
+            params = receipt.get('params')
+            if params is None:
+                return plan
+            controller = AssembleOnto(self)
+            controller._observation_job = job
+            return refresh(controller, job, plan, params)
+
+    def _fresh_look_latest(self, target_id: str, track) -> bool:
+        """Re-place the target from the perception loop's latest frame, read by itself.
+
+        Without a segmenter URL there is no service to ask: phase1 worlds send anonymous instance
+        masks with every frame and phase0 worlds the detector's own noisy boxes, so the latest
+        primary frame carries the geometry (never a render from this skill thread — see
+        :meth:`_poll_once`). The instance standing where the belief says is the fresh reading,
+        under the same gates as a segmented look."""
+        try:
+            frame = self._latest_frame
+            if frame is None:
+                print(f"ego: fresh look for {target_id} skipped (no perception frame to read)",
+                      file=sys.stderr, flush=True)
+                return False
+            believed = np.asarray(track.pos, float)
+            if frame.get("mask") is not None:
+                what = "the frame's own masks"
+                centre = _anonymous_reading(frame, self.estimator.camera_pose(), believed, self.config)
+            else:
+                what = "the frame's own detections"
+                cameras = [c["id"] for c in frame.get("cameras", []) if c["id"] in self.estimator.cameras] \
+                    or [self.estimator.primary_camera]
+                cams = {c: self.estimator.camera_pose(camera=c) for c in cameras}
+                centre = _detection_reading(frame, cams, believed, self.config)
+            if centre is None:
+                print(f"ego: fresh look for {target_id} ({track.category}): no instance in {what} "
+                      f"within {self.config.relocate_max_jump_m:.2f} m of the belief",
+                      file=sys.stderr, flush=True)
+                return False
+            with self._lock:
+                moved = self.estimator.relocate(target_id, centre)
+            if moved:
+                print(f"ego: fresh look placed {target_id} at ({centre[0]:.3f}, {centre[1]:.3f}, {centre[2]:.3f})",
+                      file=sys.stderr, flush=True)
+            return bool(moved)
+        except Exception as exc:
+            print(f"ego: fresh look for {target_id} failed: {exc}", file=sys.stderr, flush=True)
+            return False
+
     def _validate_placement(self, plan):
+        if _assembly_enabled():
+            self._check_skill_preconditions(plan)
         ref = (plan.get('placementTarget') or {}).get('mateReference', {})
-        with self._lock:
-            memory = self.estimator.stationary_assemblies
-            memory.update(self.estimator.tracks, self.estimator.stamp)
-            record = memory.records.get(ref.get('entity'))
-            if record is not None and record['status'] != 'frozen':
-                memory.warn(record, 'body_moved_during_approach_continue', detail=record.get('reason'))
-                record.update(status='frozen', hardMotion=False, motionSamples={})
+        if _assembly_enabled():
+            with self._lock:
+                memory = self.estimator.stationary_assemblies
+                memory.update(self.estimator.tracks, self.estimator.stamp)
+                from steward.ego.assembly_destination import validate as validate_destination
+                validate_destination(self, plan)
+                from steward.ego.place_surface import validate as validate_surface
+                validate_surface(self, plan)
+                from steward.ego.component_registration import validate_target
+                validate_target(self, plan)
+                record = memory.records.get(ref.get('entity'))
+                if record is not None and record['status'] != 'frozen':
+                    memory.warn(record, 'body_moved_during_approach_continue', detail=record.get('reason'))
+                    record.update(status='frozen', hardMotion=False, motionSamples={})
+        else:
+            with self._lock:
+                memory = self.estimator.stationary_assemblies
+                memory.update(self.estimator.tracks, self.estimator.stamp)
+                record = memory.records.get(ref.get('entity'))
+                if record is not None and record['status'] != 'frozen':
+                    memory.warn(record, 'body_moved_during_approach_continue', detail=record.get('reason'))
+                    record.update(status='frozen', hardMotion=False, motionSamples={})
+
+    if _assembly_enabled():
+        def _predict_assembly_session(self, es, params):
+            from steward.ego.assembly_session import predict
+            return predict(self, es, params)
 
     def _fasten(self, job, plan):
+        if _assembly_enabled():
+            if plan.get('sessionGoal') is not None or plan.get('resumeSession'):
+                from steward.ego.assembly_session import Session
+                return Session(self).run(job, plan)
         from steward.ego.fasten import Fasten
         Fasten(self).run(job, plan)
 
@@ -2754,6 +3855,11 @@ class EgoRuntime:
 
     def _consume_receipt(self, receipt, *, check_diagnosis: bool = False):
         receipt_id = receipt['id']
+        if _assembly_enabled():
+            from steward.ego import session_inventory
+            ownership = session_inventory.guard(self, receipt.get('skill'), receipt.get('params', {}))
+            if ownership:
+                raise PermissionError(ownership['message'])
         if self._receipt_generation.get(receipt_id) != self._generation:
             raise PermissionError('receipt belongs to a different sensor session')
         now = self.estimator.stamp
@@ -2768,16 +3874,39 @@ class EgoRuntime:
             raise PermissionError(f"receipt risk {receipt['risk']:.2f} exceeds the limit {limit:.2f}")
         if check_diagnosis:
             self._check_motion_diagnosis(receipt["skill"], receipt)
+        if _assembly_enabled():
+            self._check_skill_preconditions(receipt['plan'], phase='consume')
         receipt["used"] = True
+        if _assembly_enabled():
+            from steward.ego.assembly_session import current
+            if current() is not None:
+                current().emit('primitive_consume', skill=receipt['skill'], receipt=receipt_id,
+                               predictedAt=receipt.get('createdAt'), consumedAt=now)
         return receipt['plan']
 
     def run(self, receipt_id: str, owner: str | None = None) -> dict:
         """Execute a predicted plan. The runtime re-checks the receipt here, where the motion happens."""
         self._check_control(owner)
-        with self._lock:
+        with self._arm_selection_lock:
+            current = self.executor.current
+            if current is not None and current.is_running:
+                raise RuntimeError(f"skill {current.skill} ({current.id}) is still running")
             receipt = self.receipt(receipt_id)
+            planner = self._planner_for(receipt.get("params") or {})
+            issue = self._arm_load_issue(planner)
+            if issue is not None:
+                raise PermissionError(issue)
             self._consume_receipt(receipt, check_diagnosis=True)
-            job = self.executor.start(receipt["skill"], receipt, episode_generation=self._generation).to_dict()
+            if planner.arm is not self.arm and isinstance(planner.arm, PiperArm):
+                planner.arm.invalidate_target()
+            self.esim, self.arm = planner, planner.arm
+            with self._lock:
+                self.estimator.select_gripper(self.arm.geometry.gripper)
+            job = self.executor.start(receipt["skill"], receipt,
+                                      episode_generation=self._generation).to_dict()
+        if _assembly_enabled():
+            from steward.ego.memory_checkpoint import result_fields
+            job.update(result_fields(self))
         params = receipt.get("params") or {}
         target = params.get("target") or params.get("on") or (f"({params['x']:.2f}, {params['y']:.2f})" if "x" in params else "")
         self._log("skill", f"{receipt['skill']} 开始" + (f"：{target}" if target else ""))
@@ -2804,15 +3933,29 @@ class EgoRuntime:
             raise HttpError(409, "Robot motion is paused until the recovery subagent submits a diagnosis.",
                             code="diagnosis_required")
 
-    def explore(self, owner: str | None = None) -> dict:
-        """Look around in place. Rotation without translation needs no receipt.
+    if _assembly_enabled():
+        def explore(self, owner: str | None = None, timeout_s: float = 120.) -> dict:
+            """Look around in place. Rotation without translation needs no receipt.
 
-        When ``MotionConfig.inspect_closed_drawers`` is set, each closed drawer is opened, looked
-        into, and closed afterwards. Those visits are planned from the ego state at the time and
-        skipped when they are not feasible."""
-        self._check_control(owner)
-        receipt = {"id": "look-around", "plan": {}}
-        with self._lock:
+            With ASSEMBLY_ACTION_BUDGET, timeout_s bounds simulation time; the measured wall watchdog only
+            guards stalled IO. With ASSEMBLY_ACTION_BUDGET disabled it bounds wall lifetime. On expiry it
+            returns the accumulated Ego observations. The bounded scan does not append drawer
+            inspection or arm homing; STEWARD_LOOK_TIMEOUT=0 retains the legacy behaviour."""
+            self._check_control(owner)
+            return self._start_explore({"timeoutS": timeout_s})
+    else:
+        def explore(self, owner: str | None = None) -> dict:
+            """Look around in place. Rotation without translation needs no receipt.
+
+            When ``MotionConfig.inspect_closed_drawers`` is set, each closed drawer is opened, looked
+            into, and closed afterwards. Those visits are planned from the ego state at the time and
+            skipped when they are not feasible."""
+            self._check_control(owner)
+            return self._start_explore({})
+
+    def _start_explore(self, plan: dict) -> dict:
+        receipt = {"id": "look-around", "plan": plan}
+        with self._arm_selection_lock, self._lock:
             self._check_motion_diagnosis("look_around", receipt)
             return self.executor.start("look_around", receipt, episode_generation=self._generation).to_dict()
 

@@ -1,4 +1,7 @@
 """Robot-owned forward kinematics and gripper transforms from synchronized encoder packets."""
+
+from steward.assembly_profile import enabled as _assembly_enabled
+
 import math
 
 import numpy as np
@@ -32,7 +35,9 @@ def _link_pose(model: dict, encoders: dict, link: str) -> dict:
         if kind == "prismatic":
             motion = {"p": (np.asarray(axis) * value).tolist(), "q": [1, 0, 0, 0]}
         elif kind == "revolute":
-            motion = {"p": [0, 0, 0], "q": quat_from_axis_angle(axis, value)}
+            rotation = quat_from_axis_angle(axis, value)
+            anchor = np.asarray((joint.get("anchor") or {}).get("value", [0, 0, 0]))
+            motion = {"p": (anchor - matrix_from_quat(rotation) @ anchor).tolist(), "q": rotation}
         else:
             raise ValueError(f"Unsupported robot kinematics joint: {kind}")
         result = pose_compose(result, motion)
@@ -56,13 +61,17 @@ def camera_to_base(model: dict, encoders: dict, camera: str) -> np.ndarray:
     return _matrix(pose_compose(_link_pose(model, encoders, link), offset)) @ _MOUNT_FROM_OPENCV
 
 
-def base_to_odometry(odom: dict) -> np.ndarray:
-    """Map robot base points into the frame reported by planar odometry."""
-    if any(type(odom.get(key)) not in (int, float) or not math.isfinite(odom[key]) for key in ("x", "y", "yaw")):
-        raise ValueError("Missing or invalid synchronized robot odometry")
-    yaw = odom["yaw"]
-    return np.array([[math.cos(yaw), -math.sin(yaw), 0, odom["x"]],
-                     [math.sin(yaw), math.cos(yaw), 0, odom["y"]], [0, 0, 1, 0], [0, 0, 0, 1]])
+if _assembly_enabled():
+    def camera_rig(model: dict, encoders: dict) -> dict:
+        """Relative camera calibration at encoder time; exclusively robot-owned geometry."""
+        flu_from_cv = np.array([[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
+        transforms = {sensor['id']: _matrix(pose_compose(_link_pose(model, encoders, link['id']),
+                      sensor['mount'])) @ flu_from_cv
+                      for link in model['body']['links'] for sensor in link.get('sensors', [])
+                      if sensor.get('kind') in ('rgb', 'depth', 'rgbd')}
+        inverse = np.linalg.inv(transforms['head_camera'])
+        return {key: {'camera_to_reference': np.round(inverse @ value, 12).tolist()}
+                for key, value in transforms.items()}
 
 
 def reference_to_odometry(model: dict, packet: dict) -> np.ndarray:
@@ -115,3 +124,12 @@ def gripper_pose(model: dict, packet: dict, gripper: str | None = None, joints: 
             "camera_axes": CAMERA_AXES, "joint_positions": dict(encoders if joints is None else joints),
             "gripper_to_base": gripper_base.tolist(),
             "gripper_to_camera": relative}
+
+
+def base_to_odometry(odom: dict) -> np.ndarray:
+    """Map robot base points into the frame reported by planar odometry."""
+    if any(type(odom.get(key)) not in (int, float) or not math.isfinite(odom[key]) for key in ("x", "y", "yaw")):
+        raise ValueError("Missing or invalid synchronized robot odometry")
+    yaw = odom["yaw"]
+    return np.array([[math.cos(yaw), -math.sin(yaw), 0, odom["x"]],
+                     [math.sin(yaw), math.cos(yaw), 0, odom["y"]], [0, 0, 1, 0], [0, 0, 0, 1]])
