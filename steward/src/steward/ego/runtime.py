@@ -3211,70 +3211,16 @@ class EgoRuntime:
         """Pause the simulated clock for an active recovery turn and release by lease owner."""
         with self._lock:
             if action == "pause":
-                attempt, _ = self._recovery_scope(recovery_id, review_id)
-                self._require_answered_recovery_context(attempt)
+                self._recovery_scope(recovery_id, review_id)
             episode = self._episode
         return {"supported": self.link.recovery_clock(owner, action, episode)}
 
-    def finish_recovery_diagnosis(self, recovery_id: str, completed: bool, report: dict | None = None,
-                                  child_id: str | None = None) -> dict:
+    def finish_recovery_diagnosis(self, recovery_id: str, completed: bool, report: dict | None = None) -> dict:
         """Save the diagnosis or abandon recovery while preserving the originating fault."""
         with self._lock:
             monitor = self.fault_monitor
-            if completed:
-                attempt = monitor.require_recovery(recovery_id, "diagnosing")
-                self._require_answered_recovery_context(attempt)
-                if attempt.get("childId") is not None and attempt["childId"] != child_id:
-                    raise ValueError("recovery diagnosis must come from its original child session")
-                attempt["childId"] = child_id
             monitor.finish_diagnosis(recovery_id, self.estimator.stamp, completed, report)
             return monitor.status()
-
-    @staticmethod
-    def _require_answered_recovery_context(attempt: dict) -> None:
-        if attempt.get("contextRequest") is not None:
-            raise ValueError("answer the pending recovery context request first")
-
-    def request_recovery_context(self, recovery_id: str, review_id: str | None, child_id: str, parent_id: str,
-                                 question: str, reason: str) -> dict:
-        """Park the scoped child turn while EH supplies additional information."""
-        with self._lock:
-            attempt, scope = self._recovery_scope(recovery_id, review_id)
-            self._require_answered_recovery_context(attempt)
-            if scope.get("childId") is not None and scope["childId"] != child_id:
-                raise ValueError("recovery context must be requested by the original child session")
-            attempt["childId"] = child_id
-            request = {"id": f"context-{next(self._recovery_ids)}", "question": question, "reason": reason}
-            attempt.update(contextRequest=request, contextOwner=parent_id)
-            return {**self.fault_monitor.status(), "needsContext": True, "request": copy.deepcopy(request)}
-
-    def answer_recovery_context(self, recovery_id: str, request_id: str, parent_id: str, answer: str) -> dict:
-        """Consume one pending question and return the context to send to the same child session."""
-        if not 0 < len(answer.strip()) <= RECOVERY_CONTEXT_MAX:
-            raise ValueError(f"recovery context answer must contain 1 to {RECOVERY_CONTEXT_MAX} characters")
-        with self._lock:
-            monitor = self.fault_monitor
-            attempt = monitor.recovery
-            if attempt is None or attempt["id"] != recovery_id:
-                raise ValueError("recovery is no longer active")
-            request = attempt.get("contextRequest")
-            if request is None or request["id"] != request_id:
-                raise ValueError("recovery context request is no longer pending")
-            if attempt["contextOwner"] != parent_id:
-                raise ValueError("answer the recovery context request from its original EH session")
-            actions, observations = monitor.diagnosis_history(recovery_id, attempt["phase"])
-            review = attempt.get("review")
-            if review is not None:
-                observations = self._recovery_inspections(observations)
-                known = {row["ref"]: row for row in review["observations"] + observations}
-                review["observations"] = sorted(known.values(), key=lambda row: row["sequence"])[-monitor.config.history_limit:]
-                observations = review["observations"]
-            attempt.pop("contextRequest")
-            attempt.pop("contextOwner")
-            return {"childId": attempt["childId"], "reviewId": review["id"] if review else None,
-                    "completionReview": review is not None and review["completion"] is not None,
-                    "evidence": {"request": copy.deepcopy(request), "answer": answer.strip(),
-                                 "actions": actions, "observations": copy.deepcopy(observations)}}
 
     @staticmethod
     def _recovery_inspections(observations: list[dict]) -> list[dict]:
@@ -3288,7 +3234,7 @@ class EgoRuntime:
                              "on": support.id if (support := self.estimator.support_of(track)) else None}
                             for track in tracks]}
 
-    def begin_task_recovery_review(self, task: str, claim: str, child_id: str) -> dict:
+    def begin_task_recovery_review(self, task: str, claim: str) -> dict:
         """Open a read-only review of the operator task and the latched fault."""
         with self._lock:
             monitor = self.fault_monitor
@@ -3296,8 +3242,6 @@ class EgoRuntime:
                 return monitor.status()
             attempt = monitor.recovery
             if attempt is not None:
-                if request := attempt.get("contextRequest"):
-                    return {**monitor.status(), "needsContext": True, "request": copy.deepcopy(request)}
                 if attempt["phase"] != "verifying":
                     return {**monitor.status(), "reason": "another recovery turn is active"}
                 recovery_id = attempt["id"]
@@ -3312,10 +3256,10 @@ class EgoRuntime:
             recovery_id = self.begin_recovery(None, task, task_review=True)["id"]
             with self._lock:
                 self.fault_monitor.finish_diagnosis(recovery_id, self.estimator.stamp, True)
-        return self.begin_recovery_review(recovery_id, [], {"task": task, "claim": claim}, child_id)
+        return self.begin_recovery_review(recovery_id, [], {"task": task, "claim": claim})
 
     def begin_recovery_review(self, recovery_id: str, references: list[str],
-                              completion: dict | None = None, child_id: str | None = None) -> dict:
+                              completion: dict | None = None) -> dict:
         """Reserve a review and capture robot evidence after the latest recorded activity."""
         with self._lock:
             monitor = self.fault_monitor
@@ -3328,7 +3272,7 @@ class EgoRuntime:
             last_action = monitor.actions[-1] if monitor.actions else None
             latest_finish = last_action["finished"] if last_action else 0
             review = {"id": review_id, "captures": {},
-                      "completion": completion, "childId": attempt.get("childId") or child_id,
+                      "completion": completion,
                       "runningJobId": job.id if job else None,
                       "lastJob": last_action["sequence"] if last_action else None,
                       "after": max(latest_finish, monitor.transition["stamp"] if completion else attempt["diagnosisFinished"])}
@@ -3350,8 +3294,7 @@ class EgoRuntime:
                 review["observations"] = observations
                 if completion:
                     self._log("state", "RECOVERY：开始任务收尾复核")
-                return {"id": recovery_id, "reviewId": review_id, "childId": review["childId"],
-                        "newChild": attempt.get("childId") is None,
+                return {"id": recovery_id, "reviewId": review_id,
                         "evidence": copy.deepcopy({"fault": monitor.transition, "faultJob": fault,
                          "diagnosis": attempt["diagnosis"],
                          "baseline": self._recovery_packet_metadata("baseline", attempt["sensor"]),
@@ -3368,8 +3311,6 @@ class EgoRuntime:
     @staticmethod
     def _end_recovery_review(attempt: dict) -> None:
         attempt.pop("review")
-        attempt.pop("contextRequest", None)
-        attempt.pop("contextOwner", None)
         attempt["phase"] = "verifying"
 
     def _recovery_review_reason(self, attempt: dict, review: dict, report: dict, stamp: float | None) -> str:
@@ -3414,7 +3355,6 @@ class EgoRuntime:
             if report is None:
                 self._end_recovery_review(attempt)
                 return self.fault_monitor.status()
-            self._require_answered_recovery_context(attempt)
             generation = self._generation
         try:
             body = self.link.sensors()
@@ -3425,7 +3365,6 @@ class EgoRuntime:
             stamp = body["stamp"] if body is not None and self._same_episode(generation, body) else None
             reason = self._recovery_review_reason(attempt, review, report, stamp)
             if reason:
-                attempt["childId"] = review["childId"]
                 attempt["lastReview"] = copy.deepcopy(report)
                 self._log("state", f"RECOVERY：复核暂未通过。{reason}")
                 self._end_recovery_review(attempt)
@@ -3930,7 +3869,7 @@ class EgoRuntime:
         if required is not None:
             if not was_pending:
                 self._log("state", f"DEGRADED：重复动作 {required['operation']} 需要先诊断（{required['job']}）")
-            raise HttpError(409, "Robot motion is paused until the recovery subagent submits a diagnosis.",
+            raise HttpError(409, "Robot motion is paused until EH submits the recovery diagnosis.",
                             code="diagnosis_required")
 
     if _assembly_enabled():

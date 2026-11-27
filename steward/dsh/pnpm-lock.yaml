@@ -260,9 +260,6 @@ importers:
       '@deepseek-ai/dsh-session':
         specifier: 0.2.1-rc.3
         version: 0.2.1-rc.3(@deepseek-ai/cordis@4.0.5)(@deepseek-ai/dsh-scope@0.2.1-rc.3(@deepseek-ai/cordis@4.0.5))
-      '@deepseek-ai/dsh-subagent':
-        specifier: 0.2.1-rc.3
-        version: 0.2.1-rc.3(c9c4f959bb440faedc0855957a89ff5d)
       '@deepseek-ai/dsh-tools':
         specifier: 0.2.1-rc.3
         version: 0.2.1-rc.3(216a232736cc22d421973382c4e97320)

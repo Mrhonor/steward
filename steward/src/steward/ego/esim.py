@@ -1185,10 +1185,8 @@ class Esim:
                     return self._predict_tighten(es, params)
                 if skill == "insert_screw_into_hole":
                     return self._predict_insert_screw_into_hole(es, params)
-                raise PredictionError(
-                    f"unknown skill {skill!r}; known: assemble_onto, navigate, pick, place, pour, open, close, "
-                    "tighten, drive_screw, insert_screw_into_hole, seat_screw, fasten_onto, flip_assembly, "
-                    "regrasp_upright")
+                from steward.ego.skill_catalog import ESIM_SKILLS
+                raise PredictionError(f"unknown skill {skill!r}; known: {', '.join(ESIM_SKILLS)}")
             except PredictionError as exc:
                 blockers = self._describe_blockers(es)
                 issues = [str(exc)] + [

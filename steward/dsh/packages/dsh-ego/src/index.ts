@@ -449,7 +449,7 @@ export abstract class EgoService extends Service {
    */
   abstract faultState(signal?: AbortSignal): Promise<{ state: 'NORMAL' | 'DEGRADED' | 'RECOVERY';
     diagnosisRequired?: { job: string; operation: string; target: string | null };
-    recovery?: { id: string; contextRequest?: { id: string; question: string; reason: string } } }>
+    recovery?: { id: string } }>
 
   /**
    * Start a diagnostic attempt and capture detached robot evidence.
@@ -490,34 +490,14 @@ export abstract class EgoService extends Service {
   abstract captureRecoveryRgbd(id: string, scope: { reviewId?: string; camera?: string }, signal?: AbortSignal): Promise<JsonObject>
 
   /**
-   * Record the child session's question and wait for EH to answer it.
-   * @param id - the recovery attempt.
-   * @param request - the scoped child, EH Session and question.
-   * @param signal - caller cancellation.
-   * @returns the pending request and recovery state.
-   */
-  abstract requestRecoveryContext(id: string, request: { childId: string; parentId: string; reviewId?: string; question: string; reason: string },
-    signal?: AbortSignal): Promise<JsonObject>
-
-  /**
-   * Consume a pending question and return the evidence for continuing the same Session.
-   * @param id - the recovery attempt.
-   * @param answer - the pending question ID, EH Session and relevant context.
-   * @param signal - caller cancellation.
-   * @returns the existing child Session and evidence for its next turn.
-   */
-  abstract answerRecoveryContext(id: string, answer: { requestId: string; parentId: string; answer: string }, signal?: AbortSignal):
-    Promise<{ childId: string; reviewId: string | null; completionReview: boolean; evidence: JsonObject }>
-
-  /**
    * Move the attempt to verification or abandon it.
    * @param id - the current attempt.
    * @param completed - whether diagnosis completed successfully.
-   * @param diagnosis - the structured diagnosis and child Session ID on completion.
+   * @param report - the structured report on completion.
    * @param signal - caller cancellation.
    * @returns the diagnostic state.
    */
-  abstract finishRecovery(id: string, completed: boolean, diagnosis?: { report: JsonObject; childId: string }, signal?: AbortSignal): Promise<JsonObject>
+  abstract finishRecovery(id: string, completed: boolean, report?: JsonObject, signal?: AbortSignal): Promise<JsonObject>
 
   /**
    * Open a read-only review with fresh evidence, or return the reason it cannot start.
@@ -527,20 +507,17 @@ export abstract class EgoService extends Service {
    * @returns the review ID and evidence, or a pending status.
    */
   abstract beginRecoveryReview(id: string, referenceBacks: string[], signal?: AbortSignal):
-    Promise<{ reviewId: string; childId: string; evidence: JsonObject } | { verified: false; reason: string }>
+    Promise<{ reviewId: string; evidence: JsonObject } | { verified: false; reason: string }>
 
   /**
    * Open or resume a read-only review when an EH task is about to end.
    * @param task - the operator's current task.
    * @param claim - the EH's closing summary, treated as an unverified claim.
-   * @param childId - the reserved Session ID to use if no previous recovery child exists.
    * @param signal - caller cancellation.
-   * @returns the review and child IDs, a pending question, or the reason a review did not open.
+   * @returns the recovery and review IDs with evidence, or the current state when a review did not open.
    */
-  abstract beginTaskRecoveryReview(task: string, claim: string, childId: string, signal?: AbortSignal): Promise<
-    { id: string; reviewId: string; childId: string; newChild: boolean; evidence: JsonObject }
-    | { state: string; reason?: string; needsContext?: boolean; request?: { id: string; question: string; reason: string };
-      recovery?: { id: string } }>
+  abstract beginTaskRecoveryReview(task: string, claim: string, signal?: AbortSignal): Promise<
+    { id: string; reviewId: string; evidence: JsonObject } | { state: string; reason?: string }>
 
   /**
    * Check the review and commit recovery, or close a cancelled review for a retry.

@@ -59,7 +59,7 @@ class FaultMonitor:
                  "transition": copy.deepcopy(self.transition)}
         if self.recovery is not None:
             state["recovery"] = copy.deepcopy({k: v for k, v in self.recovery.items()
-                                               if k not in ("sensor", "captures", "review", "contextOwner")})
+                                               if k not in ("sensor", "captures", "review")})
         if self.required_diagnosis is not None:
             state["diagnosisRequired"] = copy.deepcopy(self.required_diagnosis)
         return state

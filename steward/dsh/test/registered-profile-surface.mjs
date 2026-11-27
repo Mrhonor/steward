@@ -3,11 +3,15 @@ import { registerHooks, stripTypeScriptTypes, createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { ToolRuntime, renderToolsSdk } from '@deepseek-ai/dsh-tools'
 const require = createRequire(import.meta.url)
-const dependency = Object.fromEntries(['@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm',
-  '@steward/dsh-ego', '@steward/dsh-novelanything', '@steward/dsh-rgbd-video-gen'].map(name => [name, pathToFileURL(require.resolve(name)).href]))
+const toolsRequire = createRequire(require.resolve('@deepseek-ai/dsh-tools'))
+const { SystemPrompt } = await import(pathToFileURL(toolsRequire.resolve('@deepseek-ai/dsh-system-prompt')).href)
+const workspaceRequire = createRequire(require.resolve('@steward/dsh-tool-ego'))
+const dependency = Object.fromEntries(
+  ['@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery', '@deepseek-ai/dsh-llm', '@steward/dsh-ego']
+    .map(name => [name, pathToFileURL(workspaceRequire.resolve(name)).href]),
+)
 registerHooks({
   resolve(name, context, next) {
     if (dependency[name]) return { url: dependency[name], shortCircuit: true }
@@ -33,7 +37,10 @@ export async function registeredSurface(moduleUrl, includeBundles = false) {
   new SystemPrompt(ctx, SystemPrompt.Config({}))
   const registry = new ToolRuntime(ctx)
   const tools = []
-  await plugin.apply({ ego, tools: { register(tool) { tools.push(tool); return registry.register(tool) } } })
+  await plugin.apply({ ego, on: ctx.on.bind(ctx), effect: ctx.effect.bind(ctx), tools: {
+    guard: registry.guard.bind(registry),
+    register(tool) { tools.push(tool); return registry.register(tool) },
+  } }, plugin.Config({}))
   const prediction = registry.get('ego_predict')
   const validation = {}
   for (const skill of ['complete_assembly', 'regrasp_upright', 'assemble_onto', 'fasten_onto', 'seat_screw', 'drive_screw',

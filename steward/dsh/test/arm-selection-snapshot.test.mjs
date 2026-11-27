@@ -27,7 +27,8 @@ test('Ego profile replays explicit R selection without losing the model argument
     const body = raw ? JSON.parse(raw) : undefined
     const path = new URL(req.url, 'http://localhost').pathname
     calls.push({ path, body })
-    const value = path === '/ego/predict' || path === '/ego/receipt' ? receipt
+    const value = path === '/ego/control' ? { owner: null }
+      : path === '/ego/predict' || path === '/ego/receipt' ? receipt
       : path === '/skill/run' || path === '/skill/wait' ? job : undefined
     res.writeHead(value === undefined ? 404 : 200, { 'content-type': 'application/json' })
     res.end(JSON.stringify(value ?? { error: 'Unexpected request' }))

@@ -16,7 +16,7 @@ registerHooks({
 })
 const {egoTools}=await import(pathToFileURL(process.argv[2]))
 const {parseCameraCalibration}=await import(pathToFileURL(process.argv[3]))
-const receipt={id:'receipt',skill:'fasten_onto',feasible:true,risk:0.1,maxRisk:0.35,withinRiskLimit:true,
+const receipt={id:'receipt',skill:'fasten_onto',params:{},feasible:true,risk:0.1,maxRisk:0.35,withinRiskLimit:true,
   issues:[],expiresAt:12,plan:{target:'part',support:'table',pathLength:2,reach:0.3,drive:'none',
   seatTarget:{targetSource:'observed'},releaseGapM:0.001,navigationEvidence:{reason:'unobserved'}},
   nextAction:{skill:'fasten_onto',params:{part:'part',body:'body'}},warnings:[{reason:'unverified',nextAction:{skill:'observe'}}]}

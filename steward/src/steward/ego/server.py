@@ -120,11 +120,10 @@ def _routes(runtime: EgoRuntime) -> dict:
                 raise ValueError("recovery context and job must be text")
             return runtime.begin_recovery(job, context)
         if action == "complete":
-            task, claim, child_id = b.get("task"), b.get("claim"), b.get("childId")
-            if (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
-                    or any(not isinstance(value, str) or not 0 < len(value.strip()) <= 4000 for value in (task, claim))):
-                raise ValueError("task recovery review requires the operator task, EH conclusion and child session")
-            return runtime.begin_task_recovery_review(task.strip(), claim.strip(), child_id)
+            task, claim = b.get("task"), b.get("claim")
+            if any(not isinstance(value, str) or not 0 < len(value.strip()) <= 4000 for value in (task, claim)):
+                raise ValueError("task recovery review requires the operator task and EH conclusion")
+            return runtime.begin_task_recovery_review(task.strip(), claim.strip())
         if not isinstance(id_, str) or not id_:
             raise ValueError("recovery requires its attempt ID")
         if action == "clock":
@@ -134,24 +133,10 @@ def _routes(runtime: EgoRuntime) -> dict:
                     or (review is not None and (not isinstance(review, str) or not review))):
                 raise ValueError("invalid recovery clock lease")
             return runtime.recovery_clock(id_, review, owner, operation)
-        if action == "answer_context":
-            request, answer, parent_id = b.get("requestId"), b.get("answer"), b.get("parentId")
-            if not isinstance(request, str) or not isinstance(answer, str) or not isinstance(parent_id, str) or not parent_id:
-                raise ValueError("a recovery context answer requires a request ID, EH session and text")
-            return runtime.answer_recovery_context(id_, request, parent_id, answer)
-        if action in ("analyze", "rgbd", "review", "request_context"):
+        if action in ("analyze", "rgbd", "review"):
             review = b.get("reviewId")
             if review is not None and (not isinstance(review, str) or not review):
                 raise ValueError("invalid recovery review ID")
-            if action == "request_context":
-                child_id, parent_id = b.get("childId"), b.get("parentId")
-                question, reason = b.get("question"), b.get("reason")
-                if (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
-                        or not isinstance(parent_id, str) or not parent_id
-                        or any(not isinstance(text, str) or not 0 < len(text.strip()) <= 2000
-                               for text in (question, reason))):
-                    raise ValueError("a recovery context request requires a child session, question and reason")
-                return runtime.request_recovery_context(id_, review, child_id, parent_id, question.strip(), reason.strip())
             if action == "rgbd":
                 camera = b.get("camera")
                 if camera is not None and (not isinstance(camera, str) or len(camera) > 100):
@@ -178,14 +163,13 @@ def _routes(runtime: EgoRuntime) -> dict:
             completed = b.get("completed")
             if not isinstance(completed, bool):
                 raise ValueError("diagnosis completion must be boolean")
-            report, child_id = b.get("report"), b.get("childId")
-            if completed and (not isinstance(child_id, str) or not child_id.startswith("session-steward-recovery-")
-                              or not isinstance(report, dict)
+            report = b.get("report")
+            if completed and (not isinstance(report, dict)
                               or set(report) != {"cause", "evidence", "recommendation", "verification"}
                               or any(not isinstance(value, str) or not 0 < len(value.strip()) <= 4096
                                      for value in report.values())):
                 raise ValueError("a completed diagnosis requires a diagnosis report")
-            return runtime.finish_recovery_diagnosis(id_, completed, report, child_id)
+            return runtime.finish_recovery_diagnosis(id_, completed, report)
         refs = b.get("referenceBacks", [])
         if not isinstance(refs, list) or len(refs) > 2 or not all(isinstance(ref, str) for ref in refs):
             raise ValueError("referenceBacks must contain at most two Ego-State IDs")
@@ -231,8 +215,6 @@ def _routes(runtime: EgoRuntime) -> dict:
             ("POST", "/ego/recovery/clock"): lambda q, b: recovery(b, "clock"),
             ("POST", "/ego/recovery/task-review"): lambda q, b: recovery(b, "complete"),
             ("POST", "/ego/recovery/analyze"): lambda q, b: recovery(b, "analyze"),
-            ("POST", "/ego/recovery/context/request"): lambda q, b: recovery(b, "request_context"),
-            ("POST", "/ego/recovery/context/answer"): lambda q, b: recovery(b, "answer_context"),
             ("POST", "/ego/recovery/rgbd"): lambda q, b: recovery(b, "rgbd"),
             ("POST", "/ego/recovery/finish"): lambda q, b: recovery(b, "finish"),
             ("POST", "/ego/recovery/verify"): lambda q, b: recovery(b, "verify"),
@@ -294,8 +276,6 @@ def _routes(runtime: EgoRuntime) -> dict:
             ("POST", "/ego/recovery/clock"): lambda q, b: recovery(b, "clock"),
             ("POST", "/ego/recovery/task-review"): lambda q, b: recovery(b, "complete"),
             ("POST", "/ego/recovery/analyze"): lambda q, b: recovery(b, "analyze"),
-            ("POST", "/ego/recovery/context/request"): lambda q, b: recovery(b, "request_context"),
-            ("POST", "/ego/recovery/context/answer"): lambda q, b: recovery(b, "answer_context"),
             ("POST", "/ego/recovery/rgbd"): lambda q, b: recovery(b, "rgbd"),
             ("POST", "/ego/recovery/finish"): lambda q, b: recovery(b, "finish"),
             ("POST", "/ego/recovery/verify"): lambda q, b: recovery(b, "verify"),

@@ -18,14 +18,19 @@ const plugin = await import(pathToFileURL(modulePath).href)
 const tools = []
 const ego = { assemblyProfile: async () => profile, predict: async (skill, params) => ({ id: 'profile-check', skill, params, plan: {}, issues: [],
   feasible: false, withinRiskLimit: false, risk: 1, maxRisk: 0.35, expiresAt: 0 }) }
-await plugin.apply({ ego, tools: { register(tool) { tools.push(tool); return () => {} } } })
+await plugin.apply({ ego, on() {}, effect: fn => fn(), tools: {
+  guard: () => () => {},
+  register(tool) { tools.push(tool); return () => {} },
+} }, plugin.Config?.({}))
 const prediction = tools.find(tool => tool.name === 'ego_predict')
 const common = ['regrasp_upright', 'assemble_onto', 'fasten_onto', 'seat_screw', 'drive_screw', 'flip_assembly',
   'navigate', 'pick', 'place', 'pour', 'open', 'close']
 const expectedSkills = [...common, profile === 'toy' ? 'complete_assembly' : 'insert_screw_into_hole'].sort()
 const skills = prediction?.parameters?.properties?.skill?.enum
 if (!Array.isArray(skills) || JSON.stringify([...skills].sort()) !== JSON.stringify(expectedSkills)
-  || tools.length !== (profile === 'toy' ? 20 : 21)
+  || tools.length !== (profile === 'toy' ? 24 : 25)
+  || !['ego_report_degraded', 'ego_begin_recovery', 'ego_verify_recovery', 'ego_abandon_recovery']
+    .every(name => tools.some(tool => tool.name === name))
   || tools.some(tool => tool.name === 'ego_screw_holes') !== (profile !== 'toy')) {
   throw new Error(`Loaded plugin ${modulePath} exposes the wrong ${profile} interface; rebuild and reinstall the robot profile`)
 }

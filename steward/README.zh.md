@@ -26,23 +26,21 @@ Cobot 按物理夹爪分别跟踪持物。显式 `arm` 选择工作手，不会�
 
 `ego_state` 的 `fault` 字段报告当前 Episode 的诊断状态。Runtime 记录已完成的技能请求、执行前后的控制反馈和近期 `ego_inspect` 观测。默认在 180 个仿真秒内，同一轨迹翻面三次，或相同技能请求失败三次，都会将当前 Episode 标记为 `DEGRADED`。相同放置请求若三次报告成功而实时反馈仍显示持物，也会触发。Agent 可以调用 `ego_report_degraded` 并提供理由。新 Episode 从 `NORMAL` 开始。近期记录可通过 `GET /ego/fault` 查询。
 
-处于 `DEGRADED` 时，如果新指令重复了记录中的故障动作，或重复了降级后已完成的指令，Runtime 会在执行前拦截。Agent 主动上报故障时，也会检查上报前的近期指令。对同一目标翻面时，改变偏移量仍视为重复。EH 会自动启动只读诊断，收到报告或补充上下文的请求。观测和停止控制仍可使用。子 Agent 提交诊断报告后，EH 决定下一步纠正动作，后续复核再决定是否恢复到 `NORMAL`。
+处于 `DEGRADED` 时，如果新指令重复了记录中的故障动作，或重复了降级后已完成的指令，Runtime 会在执行前拦截。Agent 主动上报故障时，也会检查上报前的近期指令。对同一目标翻面时，改变偏移量仍视为重复。拦截后，EH 在当前会话开始诊断，仍可读观测或停止机器人。纠正前，EH 先提交诊断并查看返回的恢复阶段。
 
 第一次抓空且夹爪仍为空时，EH 换视角重新观察，用新证据规划下一次抓取。如果复查后抓取同一目标仍然抓空，或有其他传感器证据显示故障，EH 主动上报降级并启动只读诊断。
 
-在 `DEGRADED` 状态下，Ego Harness 可以调用 `ego_begin_recovery` 传入任务背景、成功条件、约束、已尝试的动作和观测，上下文支持最多 12,000 字符。对于 Agent 上报的故障，还可提供已记录的 Job ID。只读的 DeepSeek 子 Agent 会收到近期操作员任务原文、基线传感器数据，以及触发故障的多次尝试之间的动作和观测记录。EH 通过常规技能工具决定并执行纠正动作。
+在 `DEGRADED` 状态下，EH 可用 `ego_begin_recovery` 传入任务背景、约束、已尝试的动作和观测，最多 12,000 字符，也可选填故障 Job ID。工具返回基线传感器元数据、动作记录和观测。EH 结合当前会话中的任务与工具结果，用 `ego_submit_recovery_report` 提交原因、证据、建议和验证方法。诊断提交后，EH 通过常规预测和技能工具执行纠正动作。
 
-在 profile patch 中，`steward-tool-ego` 的 `recoveryReasoningEffort` 默认为 `max`，`recoveryTimeoutMs` 为每轮子会话设置墙钟时限，默认 360,000 毫秒。子 Agent 诊断或复核时，仿真暂停物理时钟，相机和本体读数仍可获取。子 Agent 提交报告、向 EH 追问或退出后，仿真恢复。连接中断时，暂停租约到期后自动恢复。
+在 profile patch 中，`steward-tool-ego` 的 `recoveryReasoningEffort` 默认是 `max`，`recoveryTimeoutMs` 给每次诊断或复核设置墙钟时限，默认 360,000 毫秒。诊断和复核使用本轮任务配置的 EH 模型。EH 读取和分析证据期间，仿真暂停物理时钟。提交报告、放弃恢复、超时或回合结束时释放暂停。连接中断时，暂停租约到期后恢复仿真。
 
 每条动作记录都包含 Skill 日志和近期执行阶段。停靠检查、抓取探测反馈、回撤开始和结束都带有机器人时间戳、里程计、关节读数和夹爪反馈。Job 的最终快照反映任务结束前已经执行的回撤和收尾动作。
 
 恢复 RGB-D 数据包提供与采样像素对应的内参，以及用同帧编码器和里程计计算的相机到底盘、相机到里程计坐标系变换。如果该帧用了融合定位反馈，也提供相机到 Ego-State 坐标系的变换。数据包同时提供原始关节编码器、夹爪连杆相对底盘的位姿、机械臂关节范围和工具偏移。单独读取的机身状态可能使用另一个时间戳。诊断 Python 工具可读取这些机器人观测和标定参数。
 
-诊断或复核期间，子 Agent 可以用 `ego_request_recovery_context` 提出具体问题。EH 工具返回 `needsContext` 和 `request.id` 后，EH 用 `ego_answer_recovery_context` 传入 `recovery.id`、`request.id` 和答复。无法确认的信息可以明确答复为未知。同一个子会话会收到答复和更新后的机器人记录，可以继续追问，也可以提交报告。
+`ego_verify_recovery` 用诊断以来的动作和新观测开始复核。诊断和复核期间，EH 可以用 `ego_read_recovery_rgbd` 读相机，用 `ego_analyze_recovery` 的受限 Python 分析采样 RGB 和以米为单位的深度。这些工具读取机器人观测和标定。EH 用 `ego_submit_recovery_report` 提交复核结论。Runtime 要求结论为 `resolved`，引用当前 Episode 的基线和新观测，且复核期间没有新增动作。故障仍在或证据不足时保持 `RECOVERY`，也可用 `ego_abandon_recovery` 返回 `DEGRADED`。
 
-`ego_verify_recovery` 把诊断以来的动作和新的机器人证据发给同一个 DeepSeek 恢复会话。子 Agent 根据基线、动作记录和观测判断原故障是否消失。诊断和复核时都可以用 `ego_read_recovery_rgbd` 读取机器人相机，用受限 Python 分析采样后的 RGB 和以米为单位的深度，并提交结构化报告。Runtime 在结论为 `resolved`、证据引用属于当前 Episode、同时包含基线和新观测、且复核期间机器人没有新增动作时批准恢复。故障仍在或证据不足时保持 `RECOVERY`。`ego_abandon_recovery` 可返回 `DEGRADED`。
-
-EH 即将结束操作员任务时，如果仍有故障待处理，Ego profile 会在必要的诊断完成后自动发起只读收尾复核，把原任务、EH 的结束报告和机器人证据交给恢复子 Agent。有恢复会话时继续使用原会话，子 Agent 仍可向 EH 追问。复核同时确认任务完成和故障消除，且证据有效、及时，Runtime 才会回到 `NORMAL`。故障仍在或证据不足时保留恢复状态。
+EH 即将结束操作员任务时，如果故障仍在且必要的诊断已完成，Ego profile 会让 EH 在同一回合复核。EH 收到原任务、自己拟定的结论和机器人证据。报告确认任务完成且故障消除，并引用有效的新证据后，Runtime 才会回到 `NORMAL`。
 
 可选的[分割辅助 CPU 定位实验](docs/localization/README.zh.md)使用 RGB-D、语义掩膜和 EKF。给 `steward up` 或支持的 pytest 动作用例添加 `--localization-experiment`，可同时启用累计里程计漂移和融合定位反馈。用 `--odom-drift` 或 `--apply-localization` 可分别启用，两项默认关闭。
 

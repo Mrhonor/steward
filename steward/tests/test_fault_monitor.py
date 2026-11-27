@@ -418,55 +418,13 @@ def test_live_body_evidence_can_support_recovery_without_an_rgbd_frame(review_ro
     assert result["verified"] and result["state"] == "NORMAL"
 
 
-def test_recovery_context_can_pause_diagnosis_and_review_multiple_times(review_robot):
-    runtime, sample = review_robot
+def test_recovery_start_preserves_long_task_context(review_robot):
+    runtime, _ = review_robot
     runtime.report_degraded("inconsistent grip")
-    routes = _routes(runtime)
-    start = routes["POST", "/ego/recovery/start"]
-    request_context = routes["POST", "/ego/recovery/context/request"]
-    answer_context = routes["POST", "/ego/recovery/context/answer"]
+    start = _routes(runtime)["POST", "/ego/recovery/start"]
     background = "Task constraints. " * 180 + "The success criterion is at the end."
     attempt = start({}, {"context": background})
     assert attempt["diagnostic"]["context"]["operatorContext"] == background
-    recovery_id = attempt["id"]
-    child_id, parent_id = "session-steward-recovery-existing", "session-eh"
-    scope = {"id": recovery_id, "childId": child_id, "parentId": parent_id}
-    first = request_context({}, {**scope, "question": "Which target?", "reason": "Choose observations"})
-    assert first["needsContext"] and first["recovery"]["phase"] == "diagnosing"
-    with pytest.raises(ValueError, match="pending"):
-        request_context({}, {**scope, "question": "Which camera?", "reason": "Choose a sample"})
-    with pytest.raises(ValueError, match="pending"):
-        runtime.finish_recovery_diagnosis(recovery_id, True, child_id=child_id)
-    first_id = first["request"]["id"]
-    with pytest.raises(ValueError, match="original EH"):
-        answer_context({}, {"id": recovery_id, "requestId": first_id, "parentId": "session-other", "answer": "e:1"})
-    answer = {"id": recovery_id, "requestId": first_id, "parentId": parent_id, "answer": "Target e:1"}
-    resumed = answer_context({}, answer)
-    assert resumed["childId"] == child_id and resumed["reviewId"] is None
-    assert resumed["evidence"]["answer"] == "Target e:1"
-    with pytest.raises(ValueError, match="no longer pending"):
-        answer_context({}, answer)
-
-    second = request_context({}, {**scope, "question": "Which camera?", "reason": "Choose a sample"})
-    assert second["request"]["id"] != first_id
-    face(runtime.fault_monitor, "e:1", 1, [35, 92, 147])
-    resumed = answer_context({}, {**answer, "requestId": second["request"]["id"], "answer": "Use head_camera"})
-    assert resumed["evidence"]["observations"][-1]["entity"] == "e:1"
-    runtime.finish_recovery_diagnosis(recovery_id, True, child_id=child_id)
-    sample["stamp"] = 2
-    opened = runtime.begin_recovery_review(recovery_id, [])
-    review_id = opened["reviewId"]
-    assert opened["childId"] == child_id
-    third = request_context({}, {**scope, "reviewId": review_id, "question": "What counts as success?", "reason": "Check verdict"})
-    assert third["recovery"]["phase"] == "reviewing"
-    report = verdict("resolved", "baseline", "post")
-    with pytest.raises(ValueError, match="pending"):
-        runtime.finish_recovery_review(recovery_id, review_id, report)
-    face(runtime.fault_monitor, "e:1", 2, [36, 93, 148])
-    resumed = answer_context({}, {**answer, "requestId": third["request"]["id"], "answer": "Stable sensor feedback"})
-    assert resumed["childId"] == child_id and resumed["reviewId"] == review_id
-    new_inspection = resumed["evidence"]["observations"][-1]["ref"]
-    assert runtime.finish_recovery_review(recovery_id, review_id, verdict("resolved", "baseline", new_inspection))["verified"]
 
 
 @pytest.mark.parametrize(("report_fields", "verified"), [
@@ -480,15 +438,13 @@ def test_task_closeout_requires_verified_completion_and_resolved_fault(review_ro
     monitor = runtime.fault_monitor
     task = "Leave the four pieces face-up on the table"
     claim = "All four are face-up"
-    child_id = "session-steward-recovery-closeout"
-    assert runtime.begin_task_recovery_review(task, claim, child_id) == {"state": "NORMAL"}
+    assert runtime.begin_task_recovery_review(task, claim) == {"state": "NORMAL"}
     for number in range(1, 4):
         monitor.record(action(number))
     face(monitor, "e:1", 3, [35, 92, 147])
     sample["stamp"] = 3
     route = _routes(runtime)["POST", "/ego/recovery/task-review"]
-    opened = route({}, {"task": task, "claim": claim, "childId": child_id})
-    assert opened["newChild"] and opened["childId"] == child_id
+    opened = route({}, {"task": task, "claim": claim})
     assert opened["evidence"]["taskCompletion"] == {"task": task, "claim": claim}
     assert [row["job"] for row in opened["evidence"]["faultHistory"]] == ["job-1", "job-2", "job-3"]
     assert len(monitor.actions) == 3
@@ -498,23 +454,21 @@ def test_task_closeout_requires_verified_completion_and_resolved_fault(review_ro
     assert result["verified"] == verified
     assert result["state"] == ("NORMAL" if verified else "RECOVERY")
     if not verified:
-        reopened = runtime.begin_task_recovery_review(task, claim, "session-steward-recovery-other")
-        assert not reopened["newChild"] and reopened["childId"] == child_id
+        reopened = runtime.begin_task_recovery_review(task, claim)
+        assert reopened["id"] == opened["id"] and reopened["reviewId"] != opened["reviewId"]
 
 
-def test_task_closeout_context_question_resumes_the_same_review(review_robot):
-    runtime, sample = review_robot
+def test_task_closeout_resumes_after_cancelled_review(review_robot):
+    runtime, _ = review_robot
     runtime.report_degraded("inconsistent grip")
     task, claim = "Verify the empty gripper", "Gripper is empty"
-    child_id, parent_id = "session-steward-recovery-closeout", "session-eh"
-    opened = runtime.begin_task_recovery_review(task, claim, child_id)
-    pending = runtime.request_recovery_context(opened["id"], opened["reviewId"], child_id, parent_id,
-                                               "What was the initial gripper state?", "Check the task")
-    assert runtime.begin_task_recovery_review(task, claim, child_id)["request"] == pending["request"]
-    resumed = runtime.answer_recovery_context(opened["id"], pending["request"]["id"], parent_id, "The gripper was open")
-    assert resumed["completionReview"] and resumed["childId"] == child_id and resumed["reviewId"] == opened["reviewId"]
+    opened = runtime.begin_task_recovery_review(task, claim)
+    assert "reviewId" not in runtime.begin_task_recovery_review(task, claim)
+    runtime.finish_recovery_review(opened["id"], opened["reviewId"], None)
+    resumed = runtime.begin_task_recovery_review(task, claim)
+    assert resumed["id"] == opened["id"] and resumed["reviewId"] != opened["reviewId"]
     report = {**verdict("resolved", "baseline", "post"), "taskCompleted": True}
-    assert runtime.finish_recovery_review(opened["id"], opened["reviewId"], report)["verified"]
+    assert runtime.finish_recovery_review(resumed["id"], resumed["reviewId"], report)["verified"]
 
 
 def test_repeat_blocks_dispatch_until_diagnosis_report_arrives(review_robot, monkeypatch):
@@ -547,7 +501,7 @@ def test_repeat_blocks_dispatch_until_diagnosis_report_arrives(review_robot, mon
         api.stop()
     assert not started and not receipt.get("used")
     assert runtime.fault_state()["diagnosisRequired"]["job"] == "job-3"
-    skipped = runtime.begin_task_recovery_review("Flip e:1", "Done", "session-steward-recovery-test")
+    skipped = runtime.begin_task_recovery_review("Flip e:1", "Done")
     assert skipped["state"] == "DEGRADED" and "reviewId" not in skipped
     with pytest.raises(HttpError) as bypass:
         runtime.explore()
@@ -560,19 +514,16 @@ def test_repeat_blocks_dispatch_until_diagnosis_report_arrives(review_robot, mon
 
     opened = runtime.begin_recovery(None, "Check repeated flips")
     assert opened["diagnostic"]["fault"]["diagnosisRequired"]["job"] == "job-3"
-    child_id, parent_id = "session-steward-recovery-test", "session-eh"
-    question = runtime.request_recovery_context(opened["id"], None, child_id, parent_id, "Task?", "Find intended side")
     with pytest.raises(HttpError):
         runtime.run(receipt_id)
-    runtime.answer_recovery_context(opened["id"], question["request"]["id"], parent_id, "Printed side up")
     with pytest.raises(ValueError, match="requires a diagnosis report"):
-        runtime.finish_recovery_diagnosis(opened["id"], True, child_id=child_id)
+        runtime.finish_recovery_diagnosis(opened["id"], True)
     with pytest.raises(HttpError):
         runtime.run(receipt_id)
 
     report = {"cause": "Ambiguous color", "evidence": "job-3", "recommendation": "Inspect the face",
               "verification": "Compare the backing color"}
-    diagnosed = runtime.finish_recovery_diagnosis(opened["id"], True, report, child_id)
+    diagnosed = runtime.finish_recovery_diagnosis(opened["id"], True, report)
     assert diagnosed["state"] == "RECOVERY" and "diagnosisRequired" not in diagnosed
     assert not started and not receipt.get("used")
     assert runtime.run(receipt_id)["id"] == "job-4"

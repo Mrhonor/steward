@@ -15,20 +15,16 @@ import type { EgoService, JsonObject, PredictionReceipt, SkillJob } from '@stewa
 import { recoveryTools } from './recovery.ts'
 
 export const name = 'steward-tool-ego'
-export const inject = ['tools', 'ego', 'subagents']
+export const inject = ['tools', 'ego']
 
-/** Model route and time budget for the read-only recovery diagnostician. */
+/** Reasoning effort and time budget for EH diagnosis and review. */
 export interface Config {
-  recoveryProvider: string
-  recoveryModel: string
-  /** Provider-specific reasoning effort for the recovery session. */
+  /** Provider-specific reasoning effort during recovery diagnosis and review. */
   recoveryReasoningEffort: string
   recoveryTimeoutMs: number
 }
 
 export const Config: z<Config> = z.object({
-  recoveryProvider: z.string().default('deepseek-official'),
-  recoveryModel: z.string().default('deepseek-flash'),
   recoveryReasoningEffort: z.string().min(1).default('max'),
   recoveryTimeoutMs: z.natural().min(1000).max(600_000).default(360_000),
 })
@@ -82,10 +78,7 @@ export function egoTools(ego: EgoService, profile = process.env.STEWARD_ASSEMBLY
     } catch (error) {
       if (!(error instanceof EgoError) || error.code !== 'diagnosis_required' || !diagnoseBlockedMotion || !exec.agent) throw error
       const diagnostic = await diagnoseBlockedMotion(exec.agent, exec.signal)
-      return json({ state: 'blocked', code: error.code, message: 'The command did not execute. '
-        + (diagnostic.needsContext === true
-          ? 'Answer the recovery subagent with ego_answer_recovery_context before requesting motion.'
-          : 'Read the recovery result before deciding on a new command.'), diagnostic })
+      return json({ state: 'blocked', code: error.code, message: 'The command was blocked before movement. Complete recovery diagnosis before retrying motion.', diagnostic })
     }
     return json(view(timeout === undefined ? job : await ego.wait(job.id, timeout, exec.signal)))
   }
@@ -465,7 +458,7 @@ export function egoTools(ego: EgoService, profile = process.env.STEWARD_ASSEMBLY
         + 'Interrupting a running assembly skill usually leaves the part placed but not fastened. When it ends, confirm with ego_state that the part is on its body before the next step. '
         + 'If one sub-goal shows no real progress after three high-level attempts, switch to another sub-goal and return to it later. '
         + 'The robot refuses receipts that are infeasible, expired, already used, or above the risk limit. '
-        + 'If it blocks a repeat in DEGRADED, it opens read-only recovery and returns state=blocked and the diagnosis or context request. The command did not run.',
+        + 'If Runtime blocks a repeated command in DEGRADED, the result contains state=blocked and diagnostic evidence for the current session.',
       parameters: {
         receipt: { type: 'string', required: true, description: 'Receipt id returned by ego_predict.' },
         wait: { type: 'boolean', description: 'Wait for completion (default true).' },

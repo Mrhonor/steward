@@ -5,7 +5,7 @@ import { Context } from '@deepseek-ai/cordis'
 
 for (const artifact of ['src/index.ts', 'lib/index.js']) {
   const { EgoRuntimeClient } = await import(new URL(`../packages/dsh-ego-runtime-client/${artifact}`, import.meta.url))
-  const { apply } = await import(new URL(`../packages/dsh-tool-ego/${artifact}`, import.meta.url))
+  const { apply, Config } = await import(new URL(`../packages/dsh-tool-ego/${artifact}`, import.meta.url))
   const reflection = await import(new URL(`../packages/dsh-ego-reflection/${artifact}`, import.meta.url))
   for (const environment of [undefined, 'off', 'toy']) for (const runtime of ['off', 'toy']) {
     test(`${artifact}: environment=${environment ?? 'unset'}, runtime=${runtime}`, async t => {
@@ -35,16 +35,16 @@ for (const artifact of ['src/index.ts', 'lib/index.js']) {
       t.after(() => ctx.fiber.dispose())
       const ego = new EgoRuntimeClient(ctx, { endpoint: 'http://ego.invalid', timeoutMs: 1000,
         cameraCaptureDir: 'unused', cameraMaxBytes: 1000 })
-      const consumer = { ego, tools: { register: tool => { registered.push(tool); return () => {} } },
+      const consumer = { ego, tools: { register: tool => { registered.push(tool); return () => {} }, guard: () => () => {} },
         on: (name, fn) => { const handlers = hooks.get(name) ?? []; handlers.push(fn); hooks.set(name, handlers) }, effect: fn => fn() }
-      await Promise.all([apply(consumer), reflection.apply(consumer, reflection.Config({}))])
+      await Promise.all([apply(consumer, Config({})), reflection.apply(consumer, reflection.Config({}))])
       const prediction = registered.find(tool => tool.name === 'ego_predict')
       assert.equal(prediction.parameters.properties.skill.enum.includes('complete_assembly'), runtime === 'toy')
       assert.equal(prediction.parameters.properties.skill.enum.includes('insert_screw_into_hole'), runtime === 'off')
       assert.equal(registered.some(tool => tool.name === 'ego_screw_holes'), runtime === 'off')
       assert.equal(await ego.assemblyProfile(), runtime)
       assert.deepEqual(calls, [{ path: '/ego/control', method: 'GET', body: undefined }])
-      assert.equal(hooks.has('agent/turn-stopping'), runtime === 'toy')
+      assert.equal(hooks.get('agent/turn-stopping').length, runtime === 'toy' ? 2 : 1)
       const mismatches = logs.filter(line => line.startsWith('STEWARD_HARNESS_PROFILE '))
       assert.equal(mismatches.length, (environment ?? 'off') === runtime ? 0 : 1)
       if (mismatches.length) assert.deepEqual(JSON.parse(mismatches[0].split(' ').slice(1).join(' ')),

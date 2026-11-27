@@ -1,6 +1,20 @@
 {
   "tools": [
     {
+      "name": "ego_report_degraded",
+      "description": "Record an observed difficulty such as repeated actions without progress or conflicting sensor feedback. After an isolated pick miss with an empty gripper, start by reobserving the target. This marks the episode DEGRADED. A repeated command can then require diagnosis before more motion.",
+      "parameters": {
+        "reason": {
+          "type": "string",
+          "required": true,
+          "description": "Describe the difficulty and the observations that support it."
+        }
+      },
+      "schema": {
+        "type": "json"
+      }
+    },
+    {
       "name": "ego_state",
       "description": "Read your current understanding of the world: your own position, what you are holding, the skill in progress, and every object you have perceived with its estimated position, position uncertainty in metres, size, what it rests on, and when you last saw it. Objects you have not seen are absent, and positions are estimates. orientation explains whether yawDeg is only a box axis: front/back and near-square axes may be ambiguous. screwHoles includes source and frame. Outline-compatible priors retain source=prior; positionsByRegistration lists alternative entity-frame positions (one shared index for all holes on an object). orientation.holeRegistration explains compatibility and unresolved half turns. Unregistered templates cannot drive alignment: reobserve dimensions/features or use ordinary placement. A label alone is not registration. appearance says what you remember of an object's top face: how long ago you saw it, the share seen, plain / interiorColors (plain true or interiorColors under about 20: a cardboard back; do not use spread alone — lighting makes a plain back look varied) and stale (put down since, look again); ego_match_face compares remembered faces.",
       "parameters": {},

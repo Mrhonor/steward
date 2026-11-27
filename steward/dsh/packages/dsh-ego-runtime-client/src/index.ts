@@ -214,27 +214,17 @@ export class EgoRuntimeClient extends EgoService {
     return this.call('POST', '/ego/recovery/rgbd', { id, ...scope }, signal)
   }
 
-  requestRecoveryContext(id: string, request: { childId: string; parentId: string; reviewId?: string; question: string; reason: string },
-    signal?: AbortSignal): Promise<JsonObject> {
-    return this.call('POST', '/ego/recovery/context/request', { id, ...request }, signal)
-  }
-
-  answerRecoveryContext(id: string, answer: { requestId: string; parentId: string; answer: string }, signal?: AbortSignal):
-    Promise<{ childId: string; reviewId: string | null; completionReview: boolean; evidence: JsonObject }> {
-    return this.call('POST', '/ego/recovery/context/answer', { id, ...answer }, signal)
-  }
-
-  finishRecovery(id: string, completed: boolean, diagnosis?: { report: JsonObject; childId: string }, signal?: AbortSignal): Promise<JsonObject> {
-    return this.call('POST', '/ego/recovery/finish', { id, completed, ...diagnosis }, signal)
+  finishRecovery(id: string, completed: boolean, report?: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
+    return this.call('POST', '/ego/recovery/finish', { id, completed, report }, signal)
   }
 
   beginRecoveryReview(id: string, referenceBacks: string[], signal?: AbortSignal):
-    Promise<{ reviewId: string; childId: string; evidence: JsonObject } | { verified: false; reason: string }> {
+    Promise<{ reviewId: string; evidence: JsonObject } | { verified: false; reason: string }> {
     return this.call('POST', '/ego/recovery/verify', { id, referenceBacks }, signal)
   }
 
-  beginTaskRecoveryReview(task: string, claim: string, childId: string, signal?: AbortSignal): ReturnType<EgoService['beginTaskRecoveryReview']> {
-    return this.call('POST', '/ego/recovery/task-review', { task, claim, childId }, signal)
+  beginTaskRecoveryReview(task: string, claim: string, signal?: AbortSignal): ReturnType<EgoService['beginTaskRecoveryReview']> {
+    return this.call('POST', '/ego/recovery/task-review', { task, claim }, signal)
   }
 
   finishRecoveryReview(id: string, reviewId: string, report?: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
